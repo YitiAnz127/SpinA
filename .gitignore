@@ -1,0 +1,9 @@
+node_modules/
+.npm-cache/
+.runtime/
+.env
+.env.*
+!.env.example
+data/
+*.log
+.npmrc
