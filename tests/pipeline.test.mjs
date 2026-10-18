@@ -16,7 +16,6 @@ const draft = () => ({ assessment: 'original_experiments', notes: [], samples: [
   phases: [{ local_id: 'phase_a', role: 'target_spinel', formula: fact('NiFe2O4'), identity: fact('spinel'), purity: fact('pure') }],
   method: fact(null), materials: [], steps: [], shared_from: null, unresolved_questions: [],
 }] });
-const baseline = () => ({ source_identity: 'confirmed', checked_source_ids: ['src_1'], source_gaps: [], samples: [{ name: 'A', aliases: [], material_state: 'as_prepared', evidence: [structuredClone(evidence)], checks: [] }] });
 const review = () => ({ source_identity: 'confirmed', coverage: 'complete', issues: [], notes: [], samples: [{ sample_local_id: 'sample_a', has_confirmed_errors: false, has_unresolved_issues: false, can_match: true, expandable_fields: ['phases'], missing_or_uncertain: ['method'] }] });
 const paper = { paper_id: 'TEST-001', doi: '10.1234/test', title: 'Synthetic pipeline fixture' };
 const sources = [{ id: 'src_1', path: 'data/paper/test.pdf', kind: 'body', pages: [{ number: 1, text: evidence.quote }] }];
@@ -353,13 +352,17 @@ test('publishes with only extraction and verification, and delivers a minimal JS
     const requests = [];
     const call = async request => {
       requests.push(request);
-      return JSON.stringify(request.stage === 'baseline' ? baseline() : request.stage === 'verify' ? review() : draft());
+      return JSON.stringify(request.stage === 'verify' ? review() : draft());
     };
     const result = await runDistillation(root, { ...paper, sources: [{ path: 'data/paper/test.pdf' }] }, call, { readSources: fakeReadSources, modelLabel: 'test-model' });
     assert.equal(result.status, 'published');
     assert.deepEqual(requests.map(request => request.stage), ['distill', 'verify']);
     const extractionInput = JSON.parse(requests[0].input);
     assert.deepEqual(Object.keys(extractionInput).sort(), ['paper', 'sources']);
+    const verificationInput = JSON.parse(requests[1].input);
+    assert.deepEqual(Object.keys(verificationInput).sort(), ['draft', 'paper', 'reader_view', 'review_notes', 'sources']);
+    assert.equal(verificationInput.draft.samples[0].local_id, 'sample_a');
+    assert.deepEqual(verificationInput.sources, sources);
     const delivered = JSON.parse(await readFile(join(root, 'data/distillation/runs', result.run_id, 'record.json'), 'utf8'));
     assert.deepEqual(Object.keys(delivered).sort(), ['paper', 'samples', 'sources']);
     assert.deepEqual(delivered.samples[0].phases[0].metals, ['Fe', 'Ni']);
@@ -377,11 +380,10 @@ test('publishes with only extraction and verification, and delivers a minimal JS
 test('a failed update preserves the last verified record', async () => {
   const root = await workspace();
   try {
-    const good = async request => JSON.stringify(request.stage === 'baseline' ? baseline() : request.stage === 'verify' ? review() : draft());
+    const good = async request => JSON.stringify(request.stage === 'verify' ? review() : draft());
     const input = { ...paper, sources: [{ path: 'data/paper/test.pdf' }] };
     await runDistillation(root, input, good, { readSources: fakeReadSources, modelLabel: 'test-model' });
     const bad = async request => {
-      if (request.stage === 'baseline') return JSON.stringify(baseline());
       if (request.stage === 'verify') { const r = review(); r.samples[0].has_confirmed_errors = true; return JSON.stringify(r); }
       return JSON.stringify(draft());
     };
@@ -473,7 +475,6 @@ test('a nonexistent evidence page prevents publication even when the reviewer wo
   const root = await workspace();
   try {
     const call = async request => {
-      if (request.stage === 'baseline') return JSON.stringify(baseline());
       if (request.stage === 'verify') return JSON.stringify(review());
       const d = draft(); d.samples[0].phases[0].formula.evidence[0].page = 99;
       return JSON.stringify(d);
@@ -523,7 +524,6 @@ test('rejects stale or incomplete per-sample verification', async () => {
   const root = await workspace();
   try {
     const call = async request => {
-      if (request.stage === 'baseline') return JSON.stringify(baseline());
       if (request.stage === 'verify') { const r = review(); r.samples = []; return JSON.stringify(r); }
       return JSON.stringify(draft());
     };
@@ -536,7 +536,6 @@ test('an unresolved target formula cannot become an exact-match entry', async ()
   const root = await workspace();
   try {
     const call = async request => {
-      if (request.stage === 'baseline') return JSON.stringify(baseline());
       if (request.stage === 'verify') return JSON.stringify(review());
       const d = draft(); d.samples[0].phases[0].formula = { ...fact('NiFe2O4'), status: 'ambiguous' };
       return JSON.stringify(d);
@@ -552,7 +551,7 @@ test('an unresolved target formula cannot become an exact-match entry', async ()
 test('new papers can be updated using their published identity and source manifest', async () => {
   const root = await workspace();
   try {
-    const call = async request => JSON.stringify(request.stage === 'baseline' ? baseline() : request.stage === 'verify' ? review() : draft());
+    const call = async request => JSON.stringify(request.stage === 'verify' ? review() : draft());
     await runDistillation(root, { ...paper, sources: [{ path: 'data/paper/test.pdf' }] }, call, { readSources: fakeReadSources });
     const result = await runDistillation(root, { paper_id: paper.paper_id }, call, { readSources: fakeReadSources });
     assert.equal(result.status, 'published');
@@ -566,10 +565,10 @@ test('new papers can be updated using their published identity and source manife
 test('cancellation leaves the last published record intact', async () => {
   const root = await workspace();
   try {
-    const good = async request => JSON.stringify(request.stage === 'baseline' ? baseline() : request.stage === 'verify' ? review() : draft());
+    const good = async request => JSON.stringify(request.stage === 'verify' ? review() : draft());
     await runDistillation(root, { ...paper, sources: [{ path: 'data/paper/test.pdf' }] }, good, { readSources: fakeReadSources });
     const controller = new AbortController();
-    const cancel = async request => { controller.abort(); return JSON.stringify(baseline()); };
+    const cancel = async request => { controller.abort(); return JSON.stringify(draft()); };
     const result = await runDistillation(root, { paper_id: paper.paper_id }, cancel, { readSources: fakeReadSources, signal: controller.signal });
     assert.equal(result.status, 'cancelled');
     const store = await ExperimentStore.open(root);
@@ -584,7 +583,6 @@ test('forged or truncated phase formulas are blocked despite an approving model 
     const root = await workspace();
     try {
       const call = async request => {
-        if (request.stage === 'baseline') return JSON.stringify(baseline());
         if (request.stage === 'verify') return JSON.stringify(review());
         const d = draft(); d.samples[0].phases[0].formula.value = formula;
         return JSON.stringify(d);

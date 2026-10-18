@@ -57,17 +57,6 @@ export const DraftSchema = Type.Object({
   samples: Type.Array(SampleSchema),
   notes: Type.Array(text),
 }, strict);
-export const BaselineSchema = Type.Object({
-  source_identity: choice(['confirmed', 'mismatch', 'ambiguous']),
-  checked_source_ids: Type.Array(text),
-  samples: Type.Array(Type.Object({
-    name: text, aliases: Type.Array(text),
-    material_state: text,
-    evidence: Type.Array(EvidenceSchema, { minItems: 1 }),
-    checks: Type.Array(Type.Object({ topic: text, evidence: Type.Array(EvidenceSchema) }, strict)),
-  }, strict)),
-  source_gaps: Type.Array(text),
-}, strict);
 export const VerificationSchema = Type.Object({
   source_identity: choice(['confirmed', 'mismatch', 'ambiguous']),
   coverage: choice(['complete', 'incomplete', 'undetermined']),
@@ -94,7 +83,6 @@ export const VerificationSchema = Type.Object({
 export type Evidence = Static<typeof EvidenceSchema>;
 export type Fact = Static<typeof FactSchema>;
 export type Draft = Static<typeof DraftSchema>;
-export type Baseline = Static<typeof BaselineSchema>;
 export type Verification = Static<typeof VerificationSchema>;
 export interface SourceDocument {
   id: string;
