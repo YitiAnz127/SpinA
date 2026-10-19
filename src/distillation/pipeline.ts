@@ -32,7 +32,8 @@ function verificationStructureChecks(review: Verification, draft: Draft, sources
 
 function verificationChecks(review: Verification, draft: Draft, sources: SourceDocument[]): string[] {
   const errors = verificationStructureChecks(review, draft, sources);
-  if (review.coverage !== 'complete') errors.push('核验未确认已取得来源中的相关实验覆盖完整');
+  // coverage 不再作为入库门槛：原文缺 SI、省略方法段不是抽取方能修复的问题，
+  // 只作为核验报告的参考信息保留；具体缺失已由 source_limit issue 如实记录。
   if (review.source_identity !== 'confirmed') errors.push('核验未确认来源身份');
   if (review.issues.some(issue => issue.resolution_status === 'confirmed_error') || review.samples.some(sample => sample.has_confirmed_errors)) errors.push('当前记录仍有已确认错误');
   return errors;
@@ -62,12 +63,17 @@ interface CheckedCandidate {
   draft: Draft; review: Verification; errors: string[]; notes: DraftReviewNote[]; round: number; score: number;
 }
 
-const doubts = (review: Verification) => review.issues.some(issue => issue.resolution_status !== 'resolved') || review.samples.some(sample => sample.has_unresolved_issues);
+// 疑惑只标记"需要再检查"的实质问题：已确认错误，或该修而没修完的问题。
+// 原文未报告、外文献未取得（source_limit）是如实保留的信息缺口，不算疑惑。
+const doubts = (review: Verification) =>
+  review.issues.some(issue => issue.resolution_status === 'confirmed_error' ||
+    (issue.resolution_status === 'unresolved' && issue.action === 'repair')) ||
+  review.samples.some(sample => sample.has_confirmed_errors);
 const repairableIssue = (issue: Verification['issues'][number]) => issue.resolution_status !== 'resolved' && (issue.resolution_status === 'confirmed_error' || issue.action !== 'source_limit');
 const needsRepair = (review: Verification) => review.issues.some(repairableIssue) || review.samples.some(sample => sample.has_confirmed_errors ||
   (sample.has_unresolved_issues && !review.issues.some(issue => issue.resolution_status !== 'resolved' && issue.action === 'source_limit' && (issue.sample_local_id === null || issue.sample_local_id === sample.sample_local_id))));
 const candidateScore = (review: Verification, notes: DraftReviewNote[]) =>
-  (review.coverage === 'complete' ? 0 : 100) + review.issues.filter(issue => issue.resolution_status === 'confirmed_error').length * 10 +
+  review.issues.filter(issue => issue.resolution_status === 'confirmed_error').length * 10 +
   review.samples.filter(sample => sample.has_confirmed_errors).length + review.issues.filter(issue => issue.resolution_status === 'unresolved' && repairableIssue(issue)).length +
   notes.filter(note => note.kind === 'derived').length * 10;
 

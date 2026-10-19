@@ -60,6 +60,35 @@ test('shared material references resolve only through the actual ancestor chain'
   a.shared_from='unrelated';b.steps[0].material_refs=['co_salt'];assert.ok(validateDraft(d,[]).some(x=>x.includes('原料')));
 });
 
+test('a focused step patch merges by local_id instead of replacing the whole step list', () => {
+  const empty = { raw: null, value: null, unit: null, status: 'not_reported', evidence: [], note: '' };
+  const step = (id, refs = []) => ({ local_id: id, operation: { ...empty, raw: id, status: 'reported' }, conditions: [], material_refs: refs });
+  const sample = {
+    local_id: 's1', name: 'S1', aliases: [], material_state: 'as_prepared', variables: [],
+    nominal_composition: empty, measured_composition: empty, phases: [], method: empty, materials: [],
+    steps: [step('st1'), step('st2'), step('st3')], shared_from: null, unresolved_questions: [],
+  };
+  const draft = { assessment: 'original_experiments', notes: [], samples: [sample] };
+  const patch = JSON.stringify({ patches: [{ sample_local_id: 's1', changes: { steps: [step('st2', ['m_new'])] } }] });
+  const result = schema.applyFocusedRepair(patch, draft);
+  assert.deepEqual(result.samples[0].steps.map(item => item.local_id), ['st1', 'st2', 'st3']);
+  assert.deepEqual(result.samples[0].steps[1].material_refs, ['m_new']);
+  assert.equal(result.samples[0].steps[0].operation.raw, 'st1');
+  assert.equal(result.samples[0].steps[2].operation.raw, 'st3');
+});
+
+test('a clear_steps flag still removes every step when the branch is genuinely empty', () => {
+  const empty = { raw: null, value: null, unit: null, status: 'not_reported', evidence: [], note: '' };
+  const step = id => ({ local_id: id, operation: { ...empty, raw: id, status: 'reported' }, description: empty, conditions: [], material_refs: [] });
+  const sample = {
+    local_id: 's1', name: 'S1', aliases: [], material_state: 'as_prepared', variables: [],
+    nominal_composition: empty, measured_composition: empty, phases: [], method: empty, materials: [],
+    steps: [step('st1'), step('st2')], shared_from: null, unresolved_questions: [],
+  };
+  const result = schema.applyFocusedRepair(JSON.stringify({ patches: [{ sample_local_id: 's1', clear_steps: true, changes: { steps: [] } }] }), { assessment: 'original_experiments', notes: [], samples: [sample] });
+  assert.deepEqual(result.samples[0].steps, []);
+});
+
 test('explicit phase metals support an established family without inventing individual stoichiometry', () => {
   const f=(raw,value,status='reported')=>({raw,value,status,unit:null,evidence:[{source_id:'src_1',page:1,quote:raw}],note:''});
   const phase={formula:f('NixCo(3-x)O4','NixCo(3-x)O4'),metal_elements:f('NixCo(3-x)O4 with 0.6 ≤ x ≤ 1.3',['Ni','Co'])};

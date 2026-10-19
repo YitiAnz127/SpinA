@@ -127,6 +127,30 @@ export const FocusedRepairSchema = Type.Object({
 }, strict);
 const LegacyCompactDraftSchema = compactSchema(DraftSchema, true);
 
+/** 定点修正里带 local_id 的数组按 ID 合并：patch 未提及的条目由程序原样保留，避免「只写要改的那一项」导致其余条目被静默删除。 */
+function mergeById<T extends { local_id: string }>(existing: T[], incoming: T[]): T[] {
+  const result = existing.map(item => structuredClone(item));
+  const index = new Map(result.map((item, position) => [item.local_id, position]));
+  for (const item of incoming) {
+    const position = index.get(item.local_id);
+    if (position === undefined) { index.set(item.local_id, result.length); result.push(item); }
+    else result[position] = item;
+  }
+  return result;
+}
+
+/** variables 没有 local_id，按 name 合并。 */
+function mergeByName<T extends { name: string }>(existing: T[], incoming: T[]): T[] {
+  const result = existing.map(item => structuredClone(item));
+  const index = new Map(result.map((item, position) => [item.name, position]));
+  for (const item of incoming) {
+    const position = index.get(item.name);
+    if (position === undefined) { index.set(item.name, result.length); result.push(item); }
+    else result[position] = item;
+  }
+  return result;
+}
+
 export function applyFocusedRepair(response: string, draft: Draft): Draft {
   const patch = parseOutput(response, FocusedRepairSchema) as { patches: { sample_local_id: string; clear_steps?: boolean; changes: Partial<Draft['samples'][number]> }[]; add_samples?: Draft['samples'] };
   const result = structuredClone(draft), seen = new Set<string>();
@@ -137,10 +161,21 @@ export function applyFocusedRepair(response: string, draft: Draft): Draft {
     if (!sample) throw new Error('定点修正引用了未知样品');
     if (entry.clear_steps && entry.changes.steps?.length !== 0) throw new Error('clear_steps只能与明确的空步骤数组共同使用');
     if (!entry.clear_steps && entry.changes.steps?.length === 0 && sample.steps.length) delete entry.changes.steps;
+    // 数组字段合并而非替换：模型只需给出要改的条目，其余由程序保留。
+    const changes = { ...entry.changes } as Record<string, unknown>;
+    for (const key of ['steps', 'materials', 'phases'] as const) {
+      const incoming = changes[key];
+      if (Array.isArray(incoming) && incoming.length) {
+        changes[key] = mergeById((sample[key] ?? []) as { local_id: string }[], incoming as { local_id: string }[]);
+      }
+    }
+    if (Array.isArray(changes.variables) && changes.variables.length) {
+      changes.variables = mergeByName(sample.variables as { name: string }[], changes.variables as { name: string }[]);
+    }
     const carrier = compactDraft({ assessment: draft.assessment, notes: [], samples: [sample] }) as Draft;
-    Object.assign(carrier.samples[0], entry.changes);
+    Object.assign(carrier.samples[0], changes);
     const parsed = parseDraft(JSON.stringify(carrier)).samples[0];
-    for (const key of Object.keys(entry.changes) as (keyof typeof entry.changes)[]) Object.assign(sample, { [key]: parsed[key] });
+    for (const key of Object.keys(changes) as (keyof typeof entry.changes)[]) Object.assign(sample, { [key]: parsed[key] });
   }
   if (patch.add_samples?.length) {
     const added = parseDraft(JSON.stringify({ assessment: draft.assessment, samples: patch.add_samples })).samples;

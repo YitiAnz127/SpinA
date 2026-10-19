@@ -6,8 +6,9 @@
 只提取：
 1. 仅记录目标尖晶石制备样品及所需中间体，不记录铂、裸载体等性能对照。保留名称及必要处理分支；同配方共用原料和步骤用 shared_from，分支只写差异。不为每次性能测试、循环或表征建立样品。
 2. 作者确认的目标尖晶石相、原文化学式，或有明确目标相依据的金属集合。保留影响匹配的其他相和不确定性；不把前驱体、载体元素并入目标相。
-   相的说明写在对应fact的note里（如identity.note、metal_elements.note）；phases里的每个相只含local_id、role、formula、identity、purity和metal_elements，不含note等额外字段。
+   相的说明写在对应fact的note里（如identity.note、metal_elements.note）；phases里的每个相只含local_id、role、formula、identity和metal_elements，不含note、purity等额外字段；纯度指标不属于抽取范围，不要输出。
 3. 制备方法、原料完整身份和用量、按顺序的操作，以及对应温度、时间、气氛、pH 等原文条件。operation保留足以展开操作的简短原文；不要另写重复描述。
+   温度、时间、气氛、pH等条件写在steps内与operation同级的conditions数组里，不能嵌入operation内部，样品层也没有conditions字段。
    原料写在样品的materials、按顺序的操作写在steps，两者都是样品级字段，与method同级；method只写制备方法名称或出处的简短Fact（如thermal decomposition、solid state reaction），不含数组，不能把materials、steps、shared_from等任何样品级字段嵌入method内部。
    必须保留各样品的投料比、系列组成参数及处理差异，不能只留下系列通式和共用方法。variables仅用于这些制备输入；名称使用precursor_molar_ratio、precursor_proportions、x、series_x_range、treatment_temperature、treatment_duration等明确名称。不要用variables保存晶格常数、实测缺氧量或性能结果。
    原料用量、浓度和配比的基准（每种或总量、摩尔比或质量比）必须明确。子样品的变量和条件只作用于对应步骤，不自动覆盖共用步骤中的全部条件。

@@ -63,7 +63,7 @@ test('properly retained source limitations do not cause repeated model repair ca
       r.issues[0].resolution_status = 'unresolved'; r.issues[0].action = 'source_limit';
       return JSON.stringify(r);
     }, { readSources: fakeReadSources });
-    assert.deepEqual(calls, ['distill', 'verify']); assert.equal(result.status, 'published_uncertain');
+    assert.deepEqual(calls, ['distill', 'verify']); assert.equal(result.status, 'published');
   } finally { await cleanup(root); }
 });
 
@@ -73,7 +73,7 @@ test('search attaches only sample and inherited issues instead of broadcasting a
     const d = draft(); d.samples.push({ ...structuredClone(d.samples[0]), local_id: 'sample_b', name: 'B' });
     const r = badReview(); r.samples[0].has_confirmed_errors = false; r.samples[0].can_match = true; r.samples[0].has_unresolved_issues = true;
     r.samples.push({ ...r.samples[0], sample_local_id: 'sample_b' });
-    r.issues[0] = { ...r.issues[0], sample_local_id: 'sample_b', resolution_status: 'unresolved', action: 'source_limit', proposed_correction: 'B-only limit' };
+    r.issues[0] = { ...r.issues[0], sample_local_id: 'sample_b', resolution_status: 'confirmed_error', action: 'repair', proposed_correction: 'B-only limit' };
     r.issues.push({ ...r.issues[0], sample_local_id: null, proposed_correction: 'Shared paper limit' });
     await runDistillation(root, { ...paper, sources: [{ path: 'data/paper/test.pdf' }] }, async request => JSON.stringify(request.stage === 'verify' ? r : d), { readSources: fakeReadSources });
     const store = await ExperimentStore.openExisting(root), results = store.searchByElements(['Fe', 'Ni']); store.close();
@@ -154,18 +154,19 @@ test('follow-up feedback uses the remaining focused budget rather than resetting
   const root = await workspace();
   try {
     const input = { ...paper, sources: [{ path: 'data/paper/test.pdf' }] };
-    const limited = () => { const r = badReview(); r.samples[0].has_confirmed_errors = false; r.samples[0].has_unresolved_issues = true; r.issues[0].resolution_status = 'unresolved'; r.issues[0].action = 'source_limit'; return r; };
-    await runDistillation(root, input, async request => JSON.stringify(request.stage === 'verify' ? limited() : draft()), { readSources: fakeReadSources });
-    const calls = [];
+    // 第一次跑满修正额度仍修不完 → 疑惑版；第二次从疑惑版继续，修正一次后通过
+    const broken = () => badReview();
+    await runDistillation(root, input, async request => JSON.stringify(request.stage === 'verify' ? broken() : draft()), { readSources: fakeReadSources });
+    const calls = []; let verifications = 0;
     const result = await runDistillation(root, input, async request => {
       calls.push(request.stage);
-      if (request.stage === 'verify') return JSON.stringify(limited());
+      if (request.stage === 'verify') return JSON.stringify(++verifications === 1 ? broken() : review());
       const feedback = JSON.parse(request.input).feedback;
       assert.equal(feedback.repair_round, 2); assert.equal(feedback.targeted_followup_feedback, 'Separate the confirmed branch.');
       return JSON.stringify({ patches: [{ sample_local_id: 'sample_a', changes: { unresolved_questions: ['Retained source limitation.'] } }] });
     }, { readSources: fakeReadSources, seedUncertain: true, focusedRepairs: true, initialRepairAttempts: 1, requireFeedbackRepair: true, reviewFeedback: 'Separate the confirmed branch.' });
-    assert.equal(result.status, 'published_uncertain'); assert.deepEqual(calls, ['verify', 'repair', 'verify']);
-    const store = await ExperimentStore.openExisting(root); assert.equal(store.getUncertainPaper(paper.paper_id).repair_rounds, 2); store.close();
+    assert.equal(result.status, 'published'); assert.deepEqual(calls, ['verify', 'repair', 'verify']);
+    const store = await ExperimentStore.openExisting(root); assert.equal(store.getPaper(paper.paper_id).repair_rounds, 2); store.close();
   } finally { await cleanup(root); }
 });
 
