@@ -33,12 +33,30 @@ function citedPageKeys(draft: Draft): Set<string> {
   return keys;
 }
 
-const pageImages = (sources: SourceDocument[], onlyCited?: Draft, extraKeys?: Set<string>) => {
-  const cited = onlyCited ? citedPageKeys(onlyCited) : null;
+/** 核验需要的页图：默认只给 basis='page_image' 的证据页；一旦存在 OCR 差异（quote 与页文本不符），所有引用页都要看图核读。 */
+function imagePageKeys(draft: Draft, notes: DraftReviewNote[] = []): Set<string> {
+  const keys = new Set<string>();
+  const walk = (node: unknown): void => {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) { node.forEach(walk); return; }
+    const object = node as Record<string, unknown>;
+    if (Array.isArray(object.evidence)) {
+      for (const ref of object.evidence as { source_id?: string; page?: number; basis?: string }[]) {
+        if (ref?.basis === 'page_image' && ref.source_id && typeof ref.page === 'number') keys.add(`${ref.source_id}:${ref.page}`);
+      }
+    }
+    Object.values(object).forEach(walk);
+  };
+  walk(draft);
+  if (notes.some(note => note.kind === 'quote_mismatch')) for (const key of citedPageKeys(draft)) keys.add(key);
+  return keys;
+}
+
+const pageImages = (sources: SourceDocument[], allowed?: Set<string>) => {
   return sources.flatMap(source => source.pages.flatMap(page => {
     if (!page.image_path) return [];
     const key = `${source.id}:${page.number}`;
-    if (cited && !cited.has(key) && !extraKeys?.has(key)) return [];
+    if (allowed && !allowed.has(key)) return [];
     return [{ path: page.image_path, source_id: source.id, page: page.number }];
   }));
 };
@@ -94,7 +112,7 @@ export class DistillationAgent {
       : '仅按具体反馈修正，保留已确认正确的信息。核验建议也必须对照原文，不能直接当成新实验事实。无法确认的内容明确标为未知，不反复扩展无关内容。';
     return parseDraft(await this.call({
       stage: 'repair', system: await systemPrompt('distill', CompactDraftSchema, `第${context.repair_round ?? 1}/${context.repair_limit ?? 3}次修正`) + '\n' + instruction,
-      input: JSON.stringify({ paper, sources: repairSources(sources, draft, feedback), draft: compactDraft(draft), feedback }), signal, images: pageImages(sources, draft, issuePageKeys(feedback)),
+      input: JSON.stringify({ paper, sources: repairSources(sources, draft, feedback), draft: compactDraft(draft), feedback }), signal, images: pageImages(sources, new Set([...citedPageKeys(draft), ...issuePageKeys(feedback)])),
     }));
   }
 
@@ -103,7 +121,7 @@ export class DistillationAgent {
     return applyFocusedRepair(await this.call({
       stage: 'repair', outputShape: 'patch', system: await systemPrompt('repair', focusedRepairSchema(draft), `定点修正第${context.repair_round}/${context.repair_limit}次`) +
         '\n只返回patches：sample_local_id必须逐字复制input.sample_ids里的值（不能简写为s1或自造名称，写错会被程序拒收）；每项指定现有sample_local_id和changes中确需修正的字段，不能重写整篇或返回完整draft。修改数组字段时只给出需要改动的条目（steps/materials/phases按local_id、variables按name定位），未列出的条目由程序原样保留；其他样品和字段同样由程序保留。空steps默认不删除已有步骤，只有确须删除全部步骤时才显式clear_steps=true；拆分分支时必须保留父模板中已核验的共同前处理并由子分支继承。只有核验指出缺少真实制备分支时才使用add_samples，不能新增性能对照。source_limit不靠猜测消除；仅当其限定漏传时补说明。必须修正已确认遗漏、错配和继承错误，不能只增加一条“仍有疑惑”的备注来代替修正。金属集合已明确时可独立确认metal_elements，不要求精确相计量。',
-      input: JSON.stringify({ paper, sample_ids: draft.samples.map(sample => sample.local_id), sources: repairSources(sources, draft, feedback), draft: compactDraft(draft), feedback }), signal, images: pageImages(sources, draft, issuePageKeys(feedback)),
+      input: JSON.stringify({ paper, sample_ids: draft.samples.map(sample => sample.local_id), sources: repairSources(sources, draft, feedback), draft: compactDraft(draft), feedback }), signal, images: pageImages(sources, new Set([...citedPageKeys(draft), ...issuePageKeys(feedback)])),
     }), draft);
   }
 }
@@ -115,7 +133,7 @@ export class VerificationAgent {
   async verify(paper: PaperIdentity, sources: SourceDocument[], draft: Draft, signal?: AbortSignal, reviewNotes: DraftReviewNote[] = []): Promise<Verification> {
     return parseVerification(await this.call({
       stage: 'verify', system: await systemPrompt('verify', CompactVerificationSchema, '仅核验匹配与制备所需事实'),
-      input: JSON.stringify({ paper, sources, draft, reader_view: deliveryRecord({ paper, sources: sourceManifest(sources), draft, match_entries: [] }), review_notes: reviewNotes }), signal, images: pageImages(sources, draft),
+      input: JSON.stringify({ paper, sources, draft, reader_view: deliveryRecord({ paper, sources: sourceManifest(sources), draft, match_entries: [] }), review_notes: reviewNotes }), signal, images: pageImages(sources, imagePageKeys(draft, reviewNotes)),
     }));
   }
 }
