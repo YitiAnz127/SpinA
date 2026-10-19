@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import type { TSchema } from 'typebox';
-import { CompactDraftSchema, CompactVerificationSchema, FocusedRepairSchema, applyFocusedRepair, compactDraft, parseDraft, parseVerification } from './schema.ts';
+import { CompactDraftSchema, CompactVerificationSchema, FocusedRepairSchema, applyFocusedRepair, compactDraft, focusedRepairSchema, parseDraft, parseVerification } from './schema.ts';
 import type { Draft, DraftReviewNote, Verification, PaperIdentity, SourceDocument } from './schema.ts';
 import { deliveryRecord, sourceManifest } from './store.ts';
 
@@ -53,15 +53,27 @@ function issuePageKeys(feedback: unknown): Set<string> {
   return keys;
 }
 
-async function systemPrompt(name: 'distill' | 'verify', schema: TSchema, stage: string): Promise<string> {
+/** 修正只需要看草稿引用到的页与核验取证所在的页；重发全文会白白多花几万 token。 */
+function repairSources(sources: SourceDocument[], draft: Draft, feedback: unknown): SourceDocument[] {
+  const keep = new Set([...citedPageKeys(draft), ...issuePageKeys(feedback)]);
+  if (!keep.size) return sources;
+  const trimmed = sources.map(source => ({ ...source, pages: (source.pages ?? []).filter(page => keep.has(`${source.id}:${page.number}`)) })).filter(source => source.pages.length);
+  return trimmed.length ? trimmed : sources;
+}
+
+async function systemPrompt(name: 'distill' | 'verify' | 'repair', schema: TSchema, stage: string): Promise<string> {
   const fixed = await readFile(new URL(`./prompts/${name}.md`, import.meta.url), 'utf8');
-  const pdfSkill = (await readFile(new URL('../skills/pdf-extraction/SKILL.md', import.meta.url), 'utf8')).replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '');
+  // 修正是改 JSON 字段：不需要 PDF 读取规范，也不需要草稿级的 Fact/identity 写法规则，带上只会多花 token 并把它带回"写草稿"。
+  const pdfSkill = name === 'repair' ? '' : (await readFile(new URL('../skills/pdf-extraction/SKILL.md', import.meta.url), 'utf8')).replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '');
+  const rules = name === 'repair'
+    ? '严格按上述格式输出：顶层只有 patches（必要时 add_samples），不返回 notes/samples/assessment 等草稿级字段。\n'
+    : 'Fact只写raw和evidence；value与raw不同时才写value，unit/status/note仅在必要时填写。默认value=raw、status=reported。\n' +
+      'raw必须连续出现于同一条quote。quote取最短充分原文；不换算、不推测、不填derived。文字证据须在页文本中，page_image仅用于实际提供的对应页图像。\n' +
+      '目标相identity.value用spinel/normal_spinel/inverse_spinel；不确定时标ambiguous。只有目标相全部金属有依据时才写metal_elements.value符号数组；前驱体、载体不能替代目标相依据。\n';
   return `${fixed}\n\n${pdfSkill}\n\n当前执行阶段：${stage}\n` +
     '只返回一个符合下述 JSON Schema 的 JSON 对象，不输出解释或 Markdown。\n' +
-    '只输出有用字段，省略空数组、空字符串、null 和未报告的可选字段。Fact只写raw和evidence；value与raw不同时才写value，unit/status/note仅在必要时填写。默认value=raw、status=reported。\n' +
-    'raw必须连续出现于同一条quote。quote取最短充分原文；不换算、不推测、不填derived。文字证据须在页文本中，page_image仅用于实际提供的对应页图像。\n' +
-    '目标相identity.value用spinel/normal_spinel/inverse_spinel；不确定时标ambiguous。只有目标相全部金属有依据时才写metal_elements.value符号数组；前驱体、载体不能替代目标相依据。\n' +
-    JSON.stringify(schema);
+    '只输出有用字段，省略空数组、空字符串、null 和未报告的可选字段。\n' +
+    rules + JSON.stringify(schema);
 }
 
 export class DistillationAgent {
@@ -82,16 +94,16 @@ export class DistillationAgent {
       : '仅按具体反馈修正，保留已确认正确的信息。核验建议也必须对照原文，不能直接当成新实验事实。无法确认的内容明确标为未知，不反复扩展无关内容。';
     return parseDraft(await this.call({
       stage: 'repair', system: await systemPrompt('distill', CompactDraftSchema, `第${context.repair_round ?? 1}/${context.repair_limit ?? 3}次修正`) + '\n' + instruction,
-      input: JSON.stringify({ paper, sources, draft: compactDraft(draft), feedback }), signal, images: pageImages(sources, draft, issuePageKeys(feedback)),
+      input: JSON.stringify({ paper, sources: repairSources(sources, draft, feedback), draft: compactDraft(draft), feedback }), signal, images: pageImages(sources, draft, issuePageKeys(feedback)),
     }));
   }
 
   async repairFocused(paper: PaperIdentity, sources: SourceDocument[], draft: Draft, feedback: unknown, signal?: AbortSignal): Promise<Draft> {
     const context = feedback as { repair_round: number; repair_limit: number };
     return applyFocusedRepair(await this.call({
-      stage: 'repair', outputShape: 'patch', system: await systemPrompt('distill', FocusedRepairSchema, `定点修正第${context.repair_round}/${context.repair_limit}次`) +
-        '\n只返回patches：每项指定现有sample_local_id和changes中确需修正的字段，不能重写整篇或返回完整draft。修改数组字段时只给出需要改动的条目（steps/materials/phases按local_id、variables按name定位），未列出的条目由程序原样保留；其他样品和字段同样由程序保留。空steps默认不删除已有步骤，只有确须删除全部步骤时才显式clear_steps=true；拆分分支时必须保留父模板中已核验的共同前处理并由子分支继承。只有核验指出缺少真实制备分支时才使用add_samples，不能新增性能对照。source_limit不靠猜测消除；仅当其限定漏传时补说明。必须修正已确认遗漏、错配和继承错误，不能只增加一条“仍有疑惑”的备注来代替修正。金属集合已明确时可独立确认metal_elements，不要求精确相计量。',
-      input: JSON.stringify({ paper, sources, draft, feedback }), signal, images: pageImages(sources, draft, issuePageKeys(feedback)),
+      stage: 'repair', outputShape: 'patch', system: await systemPrompt('repair', focusedRepairSchema(draft), `定点修正第${context.repair_round}/${context.repair_limit}次`) +
+        '\n只返回patches：sample_local_id必须逐字复制input.sample_ids里的值（不能简写为s1或自造名称，写错会被程序拒收）；每项指定现有sample_local_id和changes中确需修正的字段，不能重写整篇或返回完整draft。修改数组字段时只给出需要改动的条目（steps/materials/phases按local_id、variables按name定位），未列出的条目由程序原样保留；其他样品和字段同样由程序保留。空steps默认不删除已有步骤，只有确须删除全部步骤时才显式clear_steps=true；拆分分支时必须保留父模板中已核验的共同前处理并由子分支继承。只有核验指出缺少真实制备分支时才使用add_samples，不能新增性能对照。source_limit不靠猜测消除；仅当其限定漏传时补说明。必须修正已确认遗漏、错配和继承错误，不能只增加一条“仍有疑惑”的备注来代替修正。金属集合已明确时可独立确认metal_elements，不要求精确相计量。',
+      input: JSON.stringify({ paper, sample_ids: draft.samples.map(sample => sample.local_id), sources: repairSources(sources, draft, feedback), draft: compactDraft(draft), feedback }), signal, images: pageImages(sources, draft, issuePageKeys(feedback)),
     }), draft);
   }
 }

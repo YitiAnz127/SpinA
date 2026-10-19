@@ -60,6 +60,22 @@ test('shared material references resolve only through the actual ancestor chain'
   a.shared_from='unrelated';b.steps[0].material_refs=['co_salt'];assert.ok(validateDraft(d,[]).some(x=>x.includes('原料')));
 });
 
+test('a partial step patch only needs local_id plus the changed field', () => {
+  const empty = { raw: null, value: null, unit: null, status: 'not_reported', evidence: [], note: '' };
+  const step = (id, refs) => ({ local_id: id, operation: { ...empty, raw: id, status: 'reported' }, conditions: [], material_refs: refs });
+  const sample = {
+    local_id: 's1', name: 'S1', aliases: [], material_state: 'as_prepared', variables: [],
+    nominal_composition: empty, measured_composition: empty, phases: [], method: empty, materials: [],
+    steps: [step('st1', ['m_a']), step('st2', ['m_b'])], shared_from: null, unresolved_questions: [],
+  };
+  const patch = JSON.stringify({ patches: [{ sample_local_id: 's1', changes: { steps: [{ local_id: 'st2', material_refs: ['m_c'] }] } }] });
+  const result = schema.applyFocusedRepair(patch, { assessment: 'original_experiments', notes: [], samples: [sample] });
+  assert.equal(result.samples[0].steps.length, 2);
+  assert.deepEqual(result.samples[0].steps[1].material_refs, ['m_c']);
+  assert.equal(result.samples[0].steps[1].operation.raw, 'st2');
+  assert.deepEqual(result.samples[0].steps[0].material_refs, ['m_a']);
+});
+
 test('a focused step patch merges by local_id instead of replacing the whole step list', () => {
   const empty = { raw: null, value: null, unit: null, status: 'not_reported', evidence: [], note: '' };
   const step = (id, refs = []) => ({ local_id: id, operation: { ...empty, raw: id, status: 'reported' }, conditions: [], material_refs: refs });

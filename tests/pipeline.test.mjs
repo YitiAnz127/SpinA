@@ -107,7 +107,7 @@ test('focused patches preserve every unselected sample and field including unkno
   assert.equal(updated.samples[0].method.raw, 'NiFe2O4');
   const { method: _old, ...oldFields } = before.samples[0], { method: _new, ...newFields } = updated.samples[0];
   assert.deepEqual(newFields, oldFields); assert.deepEqual(updated.samples[1], before.samples[1]); assert.deepEqual(d, before);
-  assert.throws(() => applyFocusedRepair(JSON.stringify({ patches: [{ sample_local_id: 'missing', changes: { steps: [] } }] }), d), /未知样品/);
+  assert.throws(() => applyFocusedRepair(JSON.stringify({ patches: [{ sample_local_id: 'missing', changes: { steps: [] } }] }), d), /sample_local_id|未知样品/);
   const template = applyFocusedRepair(JSON.stringify({ patches: [{ sample_local_id: 'sample_a', changes: { name: 'Shared procedure', material_state: 'unspecified' } }] }), d);
   assert.equal(template.samples[0].name, 'Shared procedure'); assert.equal(template.samples[0].material_state, 'unspecified');
   assert.throws(() => applyFocusedRepair(JSON.stringify({ patches: [{ sample_local_id: 'sample_a', changes: { local_id: 'rewritten' } }] }), d), /不符合结构/);

@@ -167,6 +167,12 @@ export async function runDistillation(root: string, input: DistillInput, modelCa
       const reviewNotes = draftReviewNotes(draft, sources);
       await store.saveArtifact(run, `review_notes_${round}.json`, reviewNotes);
       let review: Verification | null = null;
+      // 非目标论文（身份不符/非目标/无相关实验）不花核验额度：程序校验足够判断能否交付，核验只服务于要入库的实验抽取。
+      if (draft.assessment !== 'original_experiments') {
+        await store.saveArtifact(run, `checks_${round}.json`, errors);
+        if (draft.assessment === 'no_relevant_experiments' && !draft.samples.length && !errors.length && !previous) return finish('skipped', '未发现本论文实际报告的相关制备实验');
+        return finish('needs_review', '论文资料不足、身份有疑问或没有可发布实验；保留已有记录');
+      }
       if (!errors.length) {
         review = await verifier.verify(paper, sources, draft, options.signal, reviewNotes);
         await store.saveArtifact(run, `verification_${round}.json`, review);
@@ -174,10 +180,6 @@ export async function runDistillation(root: string, input: DistillInput, modelCa
         if (reviewNotes.some(note => note.kind === 'derived')) errors.push('草稿仍含模型自行推导的实验值；必须删除或提供原文明示依据后才能发布');
       }
       await store.saveArtifact(run, `checks_${round}.json`, errors);
-      if (draft.assessment !== 'original_experiments') {
-        if (draft.assessment === 'no_relevant_experiments' && !draft.samples.length && !errors.length && !previous) return finish('skipped', '未发现本论文实际报告的相关制备实验');
-        return finish('needs_review', '论文资料不足、身份有疑问或没有可发布实验；保留已有记录');
-      }
       let current: CheckedCandidate | undefined;
       if (review && draft.samples.length && review.source_identity === 'confirmed' && !verificationStructureChecks(review, draft, sources).length) {
         current = { draft, review, errors, notes: reviewNotes, round, score: candidateScore(review, reviewNotes) + (pendingFeedback ? 100 : 0) };

@@ -160,7 +160,7 @@ const processItem = async item => {
       cache.requests.push({ model_key: modelKey, stage: request.stage, system: request.system, input: request.input, output, metadata }); await save(item.paper_id+'-calls.json',cache);
       return output;
     };
-    const run = await runDistillation(root, { paper_id: item.paper_id }, call, { maxRepairs: (checkOnly || distillOnly) ? 0 : 3, focusedRepairs: true, modelLabel: SOL_LABEL, distillationModelLabel: `deepseek/${distillConfig.model}:${distillConfig.effort}`, onProgress: run => { control.active_papers[item.paper_id] = run.stage; control.current_paper = item.paper_id; control.current_stage = run.stage; control.run_id = run.run_id; void snapshot(); } });
+    const run = await runDistillation(root, { paper_id: item.paper_id }, call, { maxRepairs: (checkOnly || distillOnly) ? 0 : 3, focusedRepairs: false, modelLabel: SOL_LABEL, distillationModelLabel: `deepseek/${distillConfig.model}:${distillConfig.effort}`, onProgress: run => { control.active_papers[item.paper_id] = run.stage; control.current_paper = item.paper_id; control.current_stage = run.stage; control.run_id = run.run_id; void snapshot(); } });
     if (reuseDraft) {
       const provenanceStore = await ExperimentStore.open(root);
       try { await provenanceStore.saveArtifact(run, 'check-input.json', { mode: checkOnly ? 'check_existing_draft' : 'repair_existing_draft', original_output: `data/distillation/batch/${item.paper_id}-distill-last.json`, model: savedExtraction.metadata.model, reasoning: savedExtraction.metadata.reasoning, source_versions: versions, new_distillation_calls: 0 }); }

@@ -105,14 +105,14 @@ const omittedFields = new Set(['aliases', 'variables', 'nominal_composition', 'm
 const excludedFields = new Set(['aliases', 'nominal_composition', 'measured_composition', 'purity', 'description', 'expandable_fields', 'missing_or_uncertain']);
 // Legacy records also put characterization results in variables. Keep only preparation inputs.
 const preparationVariableName = /ratio|proportion|mass_fraction|geometric_area|thickness|catalyst_load|loading|duration|temperature|time|cycles|repetition|atmosphere|pressure|concentration|dissolved_|^pH$|^x$|^series_x_range$/i;
-export const preparationVariables = (sample: Draft['samples'][number]) => sample.variables.filter(variable => preparationVariableName.test(variable.name));
+export const preparationVariables = (sample: Draft['samples'][number]) => (sample.variables ?? []).filter(variable => preparationVariableName.test(variable.name));
 function compactSchema(schema: TSchema, legacyDerived = false): TSchema {
   const result = structuredClone(schema) as TSchema & { properties?: Record<string, TSchema>; required?: string[]; items?: TSchema };
   if (result.properties) {
     const isFact = 'raw' in result.properties;
     result.properties = Object.fromEntries(Object.entries(result.properties).filter(([key]) => !excludedFields.has(key)).map(([key, child]) => [key, compactSchema(child as TSchema, legacyDerived)]));
     if (isFact && !legacyDerived) result.properties.status = choice(['reported', 'not_reported', 'source_missing', 'ambiguous', 'conflicting']);
-    result.required = (result.required ?? []).filter((key: string) => isFact ? ['raw', 'evidence'].includes(key) : !omittedFields.has(key));
+    result.required = (result.required ?? []).filter((key: string) => isFact ? ['raw', 'evidence'].includes(key) : (!omittedFields.has(key) && !(legacyDerived && key === 'phases')));
   }
   if (result.items) result.items = compactSchema(result.items, legacyDerived);
   return result;
@@ -120,11 +120,40 @@ function compactSchema(schema: TSchema, legacyDerived = false): TSchema {
 export const CompactDraftSchema = compactSchema(DraftSchema);
 export const CompactVerificationSchema = compactSchema(VerificationSchema);
 const focusedFields = ['name', 'material_state', 'variables', 'phases', 'method', 'materials', 'steps', 'shared_from', 'unresolved_questions'] as const;
+/** 定点修正的数组项只能给 local_id 加要改的字段；其余字段由程序与草稿里的旧项合并，避免模型被迫重写整项。 */
+function partialItemSchema(item: TSchema): TSchema {
+  const properties = (item as { properties: Record<string, TSchema> }).properties;
+  return Type.Object(Object.fromEntries(Object.entries(properties).map(([key, value]) => [key, key === 'local_id' ? value : Type.Optional(value)])) as Record<string, TSchema>, strict);
+}
+const focusedChanges = compactSchema(Type.Object(Object.fromEntries(
+  focusedFields.map(key => [key, Type.Optional(['steps', 'materials', 'phases'].includes(key)
+    ? Type.Array(partialItemSchema((SampleSchema.properties[key] as { items: TSchema }).items))
+    : SampleSchema.properties[key])])), strict));
 export const FocusedRepairSchema = Type.Object({
-  patches: Type.Array(Type.Object({ sample_local_id: text, clear_steps: Type.Optional(Type.Boolean()), changes: compactSchema(Type.Object(Object.fromEntries(
-    focusedFields.map(key => [key, Type.Optional(SampleSchema.properties[key])])), strict)) }, strict)),
+  patches: Type.Array(Type.Object({ sample_local_id: text, clear_steps: Type.Optional(Type.Boolean()), changes: focusedChanges }, strict)),
   add_samples: Type.Optional(Type.Array((CompactDraftSchema as typeof DraftSchema).properties.samples.items)),
 }, strict);
+/** 用草稿里真实存在的样品 ID 约束 patch，避免模型照抄核验报告里 s1 这类索引式 ID 而引用到不存在的样品。 */
+export function focusedRepairSchema(draft: Draft): TSchema {
+  // 不给枚举：模型常把样品写成 s1/s2，硬枚举会让整轮修正在结构校验就失败；
+  // 真实 ID 与索引式 ID 都交给 applyFocusedRepair 里的 resolveSampleId 解析。
+  const ids = draft.samples.map(sample => sample.local_id).filter((id): id is string => typeof id === 'string' && !!id);
+  const sampleId = ids.length ? Type.Union([text, Type.Literal(ids[0])]) : text;
+  return Type.Object({
+    patches: Type.Array(Type.Object({ sample_local_id: sampleId, clear_steps: Type.Optional(Type.Boolean()), changes: focusedChanges }, strict)),
+    add_samples: Type.Optional(Type.Array((CompactDraftSchema as typeof DraftSchema).properties.samples.items)),
+  }, strict);
+}
+
+/** 把模型给的样品指代解析成草稿里的真实 ID：真实 ID 直接用，s1/s2/sample_3 这类索引式按出现顺序映射。 */
+function resolveSampleId(draft: Draft, raw: string): string | undefined {
+  const value = String(raw ?? '').trim();
+  if (draft.samples.some(sample => sample.local_id === value)) return value;
+  const indexed = /^s(?:ample)?[_\-\s]?(\d+)$/i.exec(value);
+  if (!indexed) return undefined;
+  const at = Number(indexed[1]) - 1;
+  return draft.samples[at]?.local_id;
+}
 const LegacyCompactDraftSchema = compactSchema(DraftSchema, true);
 
 /** 定点修正里带 local_id 的数组按 ID 合并：patch 未提及的条目由程序原样保留，避免「只写要改的那一项」导致其余条目被静默删除。 */
@@ -134,7 +163,7 @@ function mergeById<T extends { local_id: string }>(existing: T[], incoming: T[])
   for (const item of incoming) {
     const position = index.get(item.local_id);
     if (position === undefined) { index.set(item.local_id, result.length); result.push(item); }
-    else result[position] = item;
+    else result[position] = { ...result[position], ...item };
   }
   return result;
 }
@@ -152,12 +181,14 @@ function mergeByName<T extends { name: string }>(existing: T[], incoming: T[]): 
 }
 
 export function applyFocusedRepair(response: string, draft: Draft): Draft {
-  const patch = parseOutput(response, FocusedRepairSchema) as { patches: { sample_local_id: string; clear_steps?: boolean; changes: Partial<Draft['samples'][number]> }[]; add_samples?: Draft['samples'] };
+  const patch = parseOutput(response, focusedRepairSchema(draft)) as { patches: { sample_local_id: string; clear_steps?: boolean; changes: Partial<Draft['samples'][number]> }[]; add_samples?: Draft['samples'] };
   const result = structuredClone(draft), seen = new Set<string>();
   for (const entry of patch.patches) {
-    if (seen.has(entry.sample_local_id)) throw new Error('同一样品只能提供一组定点修正');
-    seen.add(entry.sample_local_id);
-    const sample = result.samples.find(s => s.local_id === entry.sample_local_id);
+    const targetId = resolveSampleId(result, entry.sample_local_id);
+    if (!targetId) throw new Error('定点修正引用了未知样品');
+    if (seen.has(targetId)) throw new Error('同一样品只能提供一组定点修正');
+    seen.add(targetId);
+    const sample = result.samples.find(s => s.local_id === targetId);
     if (!sample) throw new Error('定点修正引用了未知样品');
     if (entry.clear_steps && entry.changes.steps?.length !== 0) throw new Error('clear_steps只能与明确的空步骤数组共同使用');
     if (!entry.clear_steps && entry.changes.steps?.length === 0 && sample.steps.length) delete entry.changes.steps;
@@ -172,13 +203,15 @@ export function applyFocusedRepair(response: string, draft: Draft): Draft {
     if (Array.isArray(changes.variables) && changes.variables.length) {
       changes.variables = mergeByName(sample.variables as { name: string }[], changes.variables as { name: string }[]);
     }
-    const carrier = compactDraft({ assessment: draft.assessment, notes: [], samples: [sample] }) as Draft;
-    Object.assign(carrier.samples[0], changes);
+    // 先合并再裁剪：compactDraft 会移除被排除字段与空数组，但它同时会删掉必填的 notes，这里补回。
+    const merged = { ...structuredClone(sample), ...changes } as unknown as Draft['samples'][number];
+    const compacted = compactDraft({ assessment: draft.assessment, notes: [], samples: [merged] } as unknown as Draft) as { samples?: Draft['samples'] };
+    const carrier = { assessment: draft.assessment, notes: [], samples: compacted.samples ?? [] };
     const parsed = parseDraft(JSON.stringify(carrier)).samples[0];
     for (const key of Object.keys(changes) as (keyof typeof entry.changes)[]) Object.assign(sample, { [key]: parsed[key] });
   }
   if (patch.add_samples?.length) {
-    const added = parseDraft(JSON.stringify({ assessment: draft.assessment, samples: patch.add_samples })).samples;
+    const added = parseDraft(JSON.stringify({ assessment: draft.assessment, notes: [], samples: patch.add_samples })).samples;
     for (const sample of added) {
       if (result.samples.some(existing => existing.local_id === sample.local_id)) throw new Error('新增分支的样品ID已存在');
       result.samples.push(sample);
@@ -255,7 +288,7 @@ export function parseDraft(response: string): Draft {
   for (const sample of draft.samples) {
     sample.aliases ??= []; sample.variables ??= [];
     sample.nominal_composition ??= emptyFact(); sample.measured_composition ??= emptyFact(); sample.method ??= emptyFact();
-    sample.materials ??= []; sample.steps ??= []; sample.shared_from ??= null; sample.unresolved_questions ??= [];
+    sample.materials ??= []; sample.steps ??= []; sample.phases ??= []; sample.shared_from ??= null; sample.unresolved_questions ??= [];
     for (const phase of sample.phases) { phase.formula ??= emptyFact(); phase.purity ??= emptyFact(); }
     for (const material of sample.materials) { material.amount ??= emptyFact(); material.concentration ??= emptyFact(); }
     for (const step of sample.steps) { step.description ??= emptyFact(); step.conditions ??= []; step.material_refs ??= []; }
