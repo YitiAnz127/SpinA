@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { resolve, join, sep } from 'node:path';
 import { createDeepSeekCall, deepSeekConfig, routeDistillationCalls } from '../src/distillation/deepseek.ts';
 
-const config = { apiKey: 'fixture-secret', model: 'deepseek-flash', effort: 'high' };
+const config = { apiKey: 'fixture-secret', model: 'deepseek-flash', effort: 'high', repairEffort: 'max' };
 const request = { stage: 'distill', system: 'Return JSON.', input: '{"sources":[]}' };
 const payload = (content = '{"samples":[]}', finish_reason = 'stop') => ({
   model: 'deepseek-flash', usage: { total_tokens: 42 },

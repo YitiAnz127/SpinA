@@ -160,20 +160,27 @@ const processItem = async item => {
       cache.requests.push({ model_key: modelKey, stage: request.stage, system: request.system, input: request.input, output, metadata }); await save(item.paper_id+'-calls.json',cache);
       return output;
     };
-    const run = await runDistillation(root, { paper_id: item.paper_id }, call, { maxRepairs: (checkOnly || distillOnly) ? 0 : 3, focusedRepairs: false, modelLabel: SOL_LABEL, distillationModelLabel: `deepseek/${distillConfig.model}:${distillConfig.effort}`, onProgress: run => { control.active_papers[item.paper_id] = run.stage; control.current_paper = item.paper_id; control.current_stage = run.stage; control.run_id = run.run_id; void snapshot(); } });
+    const run = await runDistillation(root, { paper_id: item.paper_id }, call, { maxRepairs: (checkOnly || distillOnly) ? 0 : 2, focusedRepairs: false, modelLabel: SOL_LABEL, distillationModelLabel: `deepseek/${distillConfig.model}:${distillConfig.effort}`, onProgress: run => { control.active_papers[item.paper_id] = run.stage; control.current_paper = item.paper_id; control.current_stage = run.stage; control.run_id = run.run_id; void snapshot(); } });
     if (reuseDraft) {
       const provenanceStore = await ExperimentStore.open(root);
       try { await provenanceStore.saveArtifact(run, 'check-input.json', { mode: checkOnly ? 'check_existing_draft' : 'repair_existing_draft', original_output: `data/distillation/batch/${item.paper_id}-distill-last.json`, model: savedExtraction.metadata.model, reasoning: savedExtraction.metadata.reasoning, source_versions: versions, new_distillation_calls: 0 }); }
       finally { provenanceStore.close(); }
     }
     item.run_id = run.run_id; item.message = run.message;
-    if (run.status === 'failed' && /usage.limit|quota|rate.limit|rate_limit|429|too many|limit.*reached/i.test(resourceError ?? run.message)) {
+    if (run.status === 'failed' && /usage limit|usage\.limit|quota|rate limit|rate_limit|requests per|HTTP\s*429|status\s*429|too many requests|limit.*reached/i.test(resourceError ?? run.message)) {
       item.status = 'waiting_for_quota'; item.message = run.message; emit({ event: 'quota_wait', paper_id: item.paper_id, message: run.message });
       // No paid fallback or reset-credit use. Keep successful earlier stages and retry after the quota window.
       if (!await waitForItem(item, quotaRetryDelay(run.message))) return;
       item.status = 'running'; continue;
     }
-    if (run.status === 'failed' && /fetch failed|network|socket|terminated|ECONN|timeout|\b52[0-9]\b|gateway timeout|upstream timeout/i.test(resourceError ?? run.message)) { item.status = 'waiting_for_network'; item.message = run.message; transientFailures++; if (!await waitForItem(item, Math.min(15,transientFailures)*60000)) return; item.status='running';continue; }
+    if (run.status === 'failed' && /fetch failed|network error|socket hang|ECONNRESET|ECONNREFUSED|ETIMEDOUT|gateway timeout|upstream timeout|HTTP\s*5\d\d|status\s*5\d\d/i.test(resourceError ?? run.message)) {
+      // 真正的传输层故障才重试，且最多 2 次：模型输出不合规（JSON 错位、结构不符）必须立即失败，不能反复烧额度。
+      transientFailures++;
+      if (transientFailures > 2) { item.status = 'failed'; item.message = `${run.message}（网络重试 ${transientFailures - 1} 次后放弃）`; item.finished_at = new Date().toISOString(); await snapshot(); emit({ event: 'paper_finished', ...item }); break; }
+      item.status = 'waiting_for_network'; item.message = run.message;
+      if (!await waitForItem(item, Math.min(15, transientFailures) * 60000)) return;
+      item.status = 'running'; continue;
+    }
     if(run.status==='failed'&&/只有 SI|尚缺正文|没有可读文本层|不是 PDF/.test(run.message))run.status='source_unavailable';
     item.status = run.status; item.finished_at = new Date().toISOString(); await snapshot(); emit({ event: 'paper_finished', ...item }); break;
     }

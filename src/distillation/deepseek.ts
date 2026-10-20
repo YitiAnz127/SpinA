@@ -6,6 +6,8 @@ export interface DeepSeekConfig {
   apiKey: string;
   model: 'deepseek-flash' | 'deepseek-v4-pro';
   effort: 'low' | 'high' | 'max';
+  /** 修正用更强推理：蒸馏 high，修正默认 max。 */
+  repairEffort: 'low' | 'high' | 'max';
 }
 export interface DeepSeekMetadata {
   provider: 'deepseek'; model: string; reasoning: string;
@@ -21,9 +23,11 @@ export function deepSeekConfig(env: NodeJS.ProcessEnv = process.env, storedApiKe
   if (!apiKey) throw new Error('请先在 SpinA /login 中配置 DeepSeek API Key，或设置 DEEPSEEK_API_KEY');
   const model = env.SPINA_DISTILL_MODEL ?? 'deepseek-flash';
   const effort = env.SPINA_DISTILL_EFFORT ?? 'high';
+  const repairEffort = env.SPINA_REPAIR_EFFORT ?? 'max';
   if (model !== 'deepseek-flash' && model !== 'deepseek-v4-pro') throw new Error('SPINA_DISTILL_MODEL 必须为 deepseek-flash 或 deepseek-v4-pro');
   if (effort !== 'low' && effort !== 'high' && effort !== 'max') throw new Error('SPINA_DISTILL_EFFORT 必须为 low、high 或 max；DeepSeek 的 medium 实际映射为 high');
-  return { apiKey, model, effort };
+  if (repairEffort !== 'low' && repairEffort !== 'high' && repairEffort !== 'max') throw new Error('SPINA_REPAIR_EFFORT 必须为 low、high 或 max；DeepSeek 的 medium 实际映射为 high');
+  return { apiKey, model, effort, repairEffort };
 }
 
 export function createDeepSeekCall(root: string, config: DeepSeekConfig, options: {
@@ -48,7 +52,7 @@ export function createDeepSeekCall(root: string, config: DeepSeekConfig, options
     const body = JSON.stringify({
       model: config.model, stream: false,
       messages: [{ role: 'system', content: request.system + `\nJSON结构示例：${example}。这只是格式示例，实际内容按来源与核验反馈填写。` }, { role: 'user', content }],
-      thinking: { type: 'enabled' }, reasoning_effort: config.effort,
+      thinking: { type: 'enabled' }, reasoning_effort: request.stage === 'repair' ? config.repairEffort : config.effort,
       max_tokens: outputBudget, response_format: { type: 'json_object' },
     });
     if (Buffer.byteLength(body) > 48 * 1024 * 1024) throw new Error('DeepSeek 请求超过 48 MiB；不会截断来源或丢弃页图');
@@ -66,7 +70,7 @@ export function createDeepSeekCall(root: string, config: DeepSeekConfig, options
     if (choice?.finish_reason !== 'stop') throw new Error(`DeepSeek 未完整返回 JSON：${choice?.finish_reason ?? 'missing_choice'}`);
     const output = choice.message?.content;
     if (typeof output !== 'string' || !output.trim()) throw new Error('DeepSeek 返回空 JSON，未更新记录');
-    options.onResult?.({ provider: 'deepseek', model: result.model ?? config.model, reasoning: config.effort, usage: result.usage, stop_reason: 'stop' });
+    options.onResult?.({ provider: 'deepseek', model: result.model ?? config.model, reasoning: request.stage === 'repair' ? config.repairEffort : config.effort, usage: result.usage, stop_reason: 'stop' });
     return output;
   };
 }

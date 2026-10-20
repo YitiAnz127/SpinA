@@ -160,6 +160,7 @@ export async function runDistillation(root: string, input: DistillInput, modelCa
       return finish(uncertain ? 'published_uncertain' : 'published', uncertain ? `已入库 ${candidate.draft.samples.length} 条样品记录，标记疑惑，可检索；修正 ${repairAttempts} 次` : `已发布 ${candidate.draft.samples.length} 条样品记录、${matches.length} 条目标相匹配项；修正 ${repairAttempts} 次`);
     };
     fallback = async reason => best ? publish(best, true, reason) : finish('needs_review', '修正已达上限，但没有来源已确认且结构可用的版本，未入库');
+    let previousReview: Verification | undefined;
     while (true) {
       const round = repairAttempts;
       await store.saveArtifact(run, `draft_${round}.json`, draft);
@@ -174,8 +175,9 @@ export async function runDistillation(root: string, input: DistillInput, modelCa
         return finish('needs_review', '论文资料不足、身份有疑问或没有可发布实验；保留已有记录');
       }
       if (!errors.length) {
-        review = await verifier.verify(paper, sources, draft, options.signal, reviewNotes);
+        review = await verifier.verify(paper, sources, draft, options.signal, reviewNotes, round > 0 ? previousReview : undefined);
         await store.saveArtifact(run, `verification_${round}.json`, review);
+        previousReview = review;
         errors = verificationChecks(review, draft, sources);
         if (reviewNotes.some(note => note.kind === 'derived')) errors.push('草稿仍含模型自行推导的实验值；必须删除或提供原文明示依据后才能发布');
       }
@@ -188,7 +190,8 @@ export async function runDistillation(root: string, input: DistillInput, modelCa
       if (!pendingFeedback && !initialOutputError && current && !errors.length && !doubts(current.review)) return await publish(current, false);
       if (!pendingFeedback && !initialOutputError && current && !errors.length && !needsRepair(current.review)) return await publish(current, true);
       if (repairAttempts === maxRepairs) {
-        if (repairAttempts === 3) return await fallback();
+        // 走完既定的修正轮数（≥2 轮）就发布尽力版本并标疑惑；check-only/distill-only 这类 0 轮或 1 轮不发布。
+        if (maxRepairs >= 2) return await fallback();
         return finish('needs_review', `仍有待解决问题：${errors.slice(0, 3).join('；') || '核验存在疑惑'}。未更新可用记录`);
       }
       let repaired = false;
@@ -218,7 +221,7 @@ export async function runDistillation(root: string, input: DistillInput, modelCa
   } catch (error) {
     const cancelled = !!options.signal?.aborted;
     if (lastResponse && !cancelled) await store.saveArtifact(run, 'last_model_output.json', lastResponse);
-    if (!cancelled && repairAttempts === 3 && fallback) return await fallback(`第三次修正后的处理未完成：${(error as Error).message}`);
+    if (!cancelled && repairAttempts === maxRepairs && fallback) return await fallback(`第三次修正后的处理未完成：${(error as Error).message}`);
     return finish(cancelled ? 'cancelled' : 'failed', cancelled ? '任务已取消，未覆盖已有记录' : (error as Error).message);
   } finally { store.close(); }
 }
