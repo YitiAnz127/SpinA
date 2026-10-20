@@ -27,6 +27,7 @@
 
 ## 禁止
 
+- 不要自创字段名（例如 `mat_go_placeholder`、`*_placeholder`、`extra_*`）；说明一律写进 `note` 或 `unresolved_questions`，schema 外的字段会让整次修正作废
 - 不要重写未涉及的字段或样品
 - 不要用"仍有疑惑"的备注代替实际修正
 - 不要为 `source_limit`（原文未报告）编造数值；原文缺失就保持未知

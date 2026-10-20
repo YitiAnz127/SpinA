@@ -240,6 +240,21 @@ export function compactDraft(draft: Draft): unknown {
 const emptyFact = (): Fact => ({ raw: null, value: null, unit: null, status: 'not_reported', evidence: [], note: '' });
 export function parseDraft(response: string): Draft {
   const full = parseModelJson(response);
+  // 纯度是表征结果、不属于抽取范围（compact schema 不含 purity），但 max 档模型常主动写它。
+  // 先按原样校验；只有因为它不合格时，才丢弃纯度重试，避免误删本来就合法的数据。
+  const dropPurity = (): void => {
+    const walk = (entry: unknown): void => {
+      if (Array.isArray(entry)) { for (const item of entry) walk(item); return; }
+      if (!entry || typeof entry !== 'object') return;
+      const object = entry as Record<string, unknown>;
+      delete object.purity;
+      for (const value of Object.values(object)) walk(value);
+    };
+    walk(full);
+  };
+  if (Check(DraftSchema, full)) return full as Draft;
+  dropPurity();
+  if (Check(DraftSchema, full)) return full as Draft;
   // Some providers put paper-wide questions at the root. Preserve them as notes,
   // without changing any scientific fact or tolerating other unknown fields.
   if (full && typeof full === 'object' && !Array.isArray(full)) {

@@ -9,6 +9,7 @@ import { imageContent } from './distillation/images.ts';
 import { ExperimentStore } from './distillation/store.ts';
 import { applyFocusedRepair, parseDraft, parseVerification } from './distillation/schema.ts';
 import { createDeepSeekCall, deepSeekConfig } from './distillation/deepseek.ts';
+import { createOpenAiCompatCall, openAiCompatConfig, OPENAI_COMPAT_LABEL } from './distillation/openai-compat.ts';
 import { SOL_POLICY, SOL_LABEL } from './model-policy.ts';
 import { quotaRetryDelay } from './batch-retry.mjs';
 
@@ -50,10 +51,13 @@ if (onlyIds) for (const item of workItems) if (item.status !== 'already_publishe
 await save('queue.json', queue);
 const registry = new ModelRegistry(await ModelRuntime.create({ credentials: new ReadOnlyAuthStorage(), modelsStorePath: resolve(root, '.runtime/model-store.json') }));
 const model = registry.find(SOL_POLICY.provider, SOL_POLICY.model);
-if (!distillOnly && (!model || !registry.hasConfiguredAuth(model))) throw Error('请先在SpinA完成ChatGPT OAuth登录');
+// 配了 OPENASI_API_KEY 就用 OpenAI 兼容端点做核验，不再依赖 ChatGPT OAuth 额度。
+const compat = openAiCompatConfig();
+const verifierLabel = compat ? OPENAI_COMPAT_LABEL(compat) : SOL_LABEL;
+if (!distillOnly && !compat && (!model || !registry.hasConfiguredAuth(model))) throw Error('请先在SpinA完成ChatGPT OAuth登录，或设置 OPENASI_API_KEY 使用兼容端点');
 const concurrency = Number(process.env.SPINA_BATCH_CONCURRENCY ?? 2);
 if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 4) throw Error('SPINA_BATCH_CONCURRENCY 必须是 1–4 的整数');
-const control = { status: 'running', mode: distillOnly ? 'distill_only' : checkOnly ? 'check_existing_drafts' : repairExisting ? 'repair_existing_drafts' : 'distill_and_verify', model: `${SOL_POLICY.provider}/${SOL_POLICY.model}`, reasoning: SOL_POLICY.reasoning, distillation_model: `deepseek/${distillConfig.model}`, distillation_reasoning: distillConfig.effort, concurrency, current_paper: null, current_stage: null, active_papers: {}, updated_at: '', resume_at: null };
+const control = { status: 'running', mode: distillOnly ? 'distill_only' : checkOnly ? 'check_existing_drafts' : repairExisting ? 'repair_existing_drafts' : 'distill_and_verify', model: verifierLabel, reasoning: compat ? compat.effort : SOL_POLICY.reasoning, distillation_model: `deepseek/${distillConfig.model}`, distillation_reasoning: distillConfig.effort, concurrency, current_paper: null, current_stage: null, active_papers: {}, updated_at: '', resume_at: null };
 const emit = value => console.log(JSON.stringify(value));
 let snapshots=Promise.resolve();
 const snapshot = () => { control.updated_at = new Date().toISOString();const state={...structuredClone(control),counts:Object.fromEntries([...new Set(queue.map(x=>x.status))].map(s=>[s,queue.filter(x=>x.status===s).length]))},items=structuredClone(queue);snapshots=snapshots.then(async()=>{await save('state.json',state);await save('queue.json',items);});return snapshots; };
@@ -132,7 +136,7 @@ const processItem = async item => {
         return savedExtraction.output;
       }
       if (checkOnly && request.stage === 'repair') throw Error('只检查模式不执行修正');
-      const modelKey = request.stage === 'verify' ? SOL_LABEL : `deepseek/${distillConfig.model}:${distillConfig.effort}`;
+      const modelKey = request.stage === 'verify' ? verifierLabel : `deepseek/${distillConfig.model}:${distillConfig.effort}`;
       const cached = cache.requests.find(c => c.model_key === modelKey && c.stage === request.stage && c.system === request.system && c.input === request.input);
       if (cached) { emit({ paper_id: item.paper_id, stage: request.stage, event: 'reuse_verified_output' }); return cached.output; }
       const started = Date.now(); emit({ paper_id: item.paper_id, stage: request.stage, event: 'request_start', model_key: modelKey, images: request.images?.length ?? 0 });
@@ -140,6 +144,8 @@ const processItem = async item => {
       try {
         if (request.stage !== 'verify') {
           output = await createDeepSeekCall(root, distillConfig, { onResult: value => { metadata = value; } })(request);
+        } else if (compat) {
+          output = await createOpenAiCompatCall(root, compat, { onResult: value => { metadata = value; } })(request);
         } else {
           const text = request.system + request.input;
           const outputBudget = Math.min(SOL_POLICY.outputTokens, model.maxTokens);
@@ -160,7 +166,7 @@ const processItem = async item => {
       cache.requests.push({ model_key: modelKey, stage: request.stage, system: request.system, input: request.input, output, metadata }); await save(item.paper_id+'-calls.json',cache);
       return output;
     };
-    const run = await runDistillation(root, { paper_id: item.paper_id }, call, { maxRepairs: (checkOnly || distillOnly) ? 0 : 2, focusedRepairs: false, modelLabel: SOL_LABEL, distillationModelLabel: `deepseek/${distillConfig.model}:${distillConfig.effort}`, onProgress: run => { control.active_papers[item.paper_id] = run.stage; control.current_paper = item.paper_id; control.current_stage = run.stage; control.run_id = run.run_id; void snapshot(); } });
+    const run = await runDistillation(root, { paper_id: item.paper_id }, call, { maxRepairs: (checkOnly || distillOnly) ? 0 : 2, focusedRepairs: false, modelLabel: verifierLabel, distillationModelLabel: `deepseek/${distillConfig.model}:${distillConfig.effort}`, onProgress: run => { control.active_papers[item.paper_id] = run.stage; control.current_paper = item.paper_id; control.current_stage = run.stage; control.run_id = run.run_id; void snapshot(); } });
     if (reuseDraft) {
       const provenanceStore = await ExperimentStore.open(root);
       try { await provenanceStore.saveArtifact(run, 'check-input.json', { mode: checkOnly ? 'check_existing_draft' : 'repair_existing_draft', original_output: `data/distillation/batch/${item.paper_id}-distill-last.json`, model: savedExtraction.metadata.model, reasoning: savedExtraction.metadata.reasoning, source_versions: versions, new_distillation_calls: 0 }); }

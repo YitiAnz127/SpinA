@@ -171,8 +171,16 @@ export async function runDistillation(root: string, input: DistillInput, modelCa
       // 非目标论文（身份不符/非目标/无相关实验）不花核验额度：程序校验足够判断能否交付，核验只服务于要入库的实验抽取。
       if (draft.assessment !== 'original_experiments') {
         await store.saveArtifact(run, `checks_${round}.json`, errors);
-        if (draft.assessment === 'no_relevant_experiments' && !draft.samples.length && !errors.length && !previous) return finish('skipped', '未发现本论文实际报告的相关制备实验');
-        return finish('needs_review', '论文资料不足、身份有疑问或没有可发布实验；保留已有记录');
+        // 三种非实验情况都如实入库（标疑惑、可检索），让每篇论文都有一个明确结果，而不是消失在 needs_review/skipped 里。
+        const reason = draft.assessment === 'insufficient_sources'
+          ? '原文资料不足（缺正文、SI 或关键方法段），未能完整抽取制备信息；如实入库供检索'
+          : draft.assessment === 'no_relevant_experiments'
+            ? '未发现本论文实际报告的相关制备实验；如实入库供检索'
+            : '论文身份存疑（标题/DOI/内容不一致），未能确认是本项目目标文献';
+        const review: Verification = { source_identity: 'ambiguous', coverage: 'incomplete', samples: [], issues: [], notes: [reason] };
+        // 已有确认版本时不用更弱的结果覆盖它。
+        if (previous?.verification_status === 'verified') return finish('needs_review', '已有来源已确认的版本，本次结果更弱，未覆盖');
+        return await publish({ draft, review, errors, notes: reviewNotes, round, score: 0 }, true, reason);
       }
       if (!errors.length) {
         review = await verifier.verify(paper, sources, draft, options.signal, reviewNotes, round > 0 ? previousReview : undefined);

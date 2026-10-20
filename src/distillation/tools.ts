@@ -61,7 +61,7 @@ export function registerDistillationTools(pi: ExtensionAPI): void {
       const store = await ExperimentStore.open(ctx.cwd);
       try {
         const preferred = store.getPaper(params.paper_id), record = store.getUncertainPaper(params.paper_id) ?? preferred;
-        if (!record || record.verification.source_identity !== 'confirmed' || !record.verified_by.startsWith(`${SOL_POLICY.provider}/${SOL_POLICY.model}:`)) throw new Error('没有来源已确认的GPT-6.1-Sol核验记录');
+        if (!record || record.verification.source_identity !== 'confirmed' || !/^(openai-codex|openai-compat)\/gpt-6\.1-sol:/.test(record.verified_by)) throw new Error('没有来源已确认的GPT-6.1-Sol核验记录');
         signal?.throwIfAborted();
         record.match_entries = matchingEntries(record.draft, record.verification);
         if (record.verification_status === 'uncertain') record.candidate_match_entries = matchingEntries(record.draft, record.verification, true)
