@@ -141,6 +141,17 @@ npm run batch -- --only SPINA-0006 --repair-existing
 | `data/distillation/pages/` | 页图缓存，按完整来源路径与 PDF 内容摘要隔离版本。 |
 | `data/distillation/batch/` | 批处理队列、每次调用的缓存与日志。 |
 
+### 演示知识库
+
+仓库自带一份生成好的知识库快照 `data/demo/spina.sqlite`（约 14 MB）：140 篇确认入库、255 篇待核对、978 条任务状态。复制到运行时位置即可直接检索：
+
+```powershell
+New-Item -ItemType Directory -Force data\distillation | Out-Null
+Copy-Item data\demo\spina.sqlite data\distillation\spina.sqlite
+```
+
+之后 `search_spinel_experiments` 与 `get_distillation_result` 立即可用，不调用模型、不读取 PDF。库内是结构化制备信息、DOI 题录、证据页码与用于核对的短引文，以及生成时的来源文件相对路径（仅路径，不含 PDF 内容）。想换成自己的语料时，删除该文件重新蒸馏即可。
+
 ## 领域工具
 
 | 工具 | 用途 |

@@ -20,6 +20,7 @@ mkdir -p data/paper data/literature
 | `data/paper/.doi_index.json` | 可选。`{ "<doi>": { "file": "data/paper/<文件名>.pdf" } }`，用于按 DOI 自动定位论文；没有时按 DOI 命名规则在 `data/paper/` 内查找。 |
 | `data/literature/selected-500.jsonl` | 可选，仅批处理需要。每行一个 JSON：`{"paper_id":"SPINA-0001","doi":"10.xxxx/xxxx","title":"..."}`。单篇 `/distill` 不需要此文件。 |
 | `data/distillation/` | 程序自动创建：SQLite 数据库、逐任务运行目录、页图缓存、批处理队列。 |
+| `data/demo/spina.sqlite` | 仓库自带的演示知识库快照（140 确认 / 255 待核对）。复制到 `data/distillation/spina.sqlite` 即可直接检索。 |
 
 ## 提醒
 

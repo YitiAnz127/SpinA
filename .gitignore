@@ -6,6 +6,7 @@ node_modules/
 !.env.example
 data/*
 !data/README.md
+!data/demo/
 reports/
 .workbuddy-ai/
 *.log
