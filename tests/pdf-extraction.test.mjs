@@ -12,6 +12,7 @@ const project = fileURLToPath(new URL('../', import.meta.url));
 const config = await readFile(resolve(project, '.runtime/pdf-tools.json'), 'utf8').then(text => JSON.parse(text.replace(/^\uFEFF/, '')), () => ({}));
 const python = process.env.SPINA_PDF_PYTHON ?? config.python;
 const exec = promisify(execFile);
+const fixtureFonts = new Map();
 
 async function fixture(t) {
   const base = resolve(project, '.runtime/tests');
@@ -21,7 +22,8 @@ async function fixture(t) {
   await mkdir(resolve(root, 'data/paper'), { recursive: true });
   await mkdir(resolve(root, '.runtime'), { recursive: true });
   await writeFile(resolve(root, '.runtime/pdf-tools.json'), JSON.stringify({ python, ocr_lang_path: resolve(project, config.ocr_lang_path ?? '.runtime/tessdata'), ocr_languages: 'eng' }));
-  await exec(python, [resolve(project, 'tests/fixtures/pdf-extraction.py'), resolve(root, 'data/paper')]);
+  const { stdout } = await exec(python, [resolve(project, 'tests/fixtures/pdf-extraction.py'), resolve(root, 'data/paper')]);
+  try { fixtureFonts.set(root, JSON.parse(stdout.trim().split('\n').pop() || '{}')); } catch { fixtureFonts.set(root, {}); }
   return root;
 }
 
@@ -85,6 +87,7 @@ test('cancelling extraction stops its subprocess and releases temporary files', 
 
 test('local English and simplified Chinese language models recognize a bilingual scan', { skip: !python }, async t => {
   const root = await fixture(t);
+  if (fixtureFonts.get(root)?.cjk === false) { t.skip('本机缺少中文字体，跳过中英混排 OCR 用例'); return; }
   await writeFile(resolve(root, '.runtime/pdf-tools.json'), JSON.stringify({ python, ocr_lang_path: resolve(project, config.ocr_lang_path ?? '.runtime/tessdata'), ocr_languages: 'eng+chi_sim' }));
   const [source] = await readSources(root, [{ path: 'data/paper/scanned-cn.pdf' }]);
   assert.match(source.pages[0].text.replace(/\s+/g, ''), /样品加热两小时/);

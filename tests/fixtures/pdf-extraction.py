@@ -1,10 +1,43 @@
 """Synthetic sources with known text, a ruled table, and an image-only page."""
+import json
+import os
 import sys
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 from pypdf import PdfWriter
 from pypdf.generic import DictionaryObject, NameObject, DecodedStreamObject
+
+# Fixture fonts must not assume one OS. The first existing candidate wins; the
+# caller reads the printed JSON to skip cases this machine cannot render.
+LATIN_FONTS = [
+    "C:/Windows/Fonts/arial.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/Library/Fonts/Arial.ttf",
+]
+CJK_FONTS = [
+    "C:/Windows/Fonts/msyh.ttc",
+    "C:/Windows/Fonts/simhei.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    "/System/Library/Fonts/PingFang.ttc",
+    "/System/Library/Fonts/Supplemental/Songti.ttc",
+]
+
+
+def pick_font(candidates, size):
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except OSError:
+                continue
+    return None
 
 
 def text_at(x, y, text):
@@ -23,9 +56,10 @@ def digital_pdf(path, commands):
     writer.write(path)
 
 directory = Path(sys.argv[1])
+latin_font = pick_font(LATIN_FONTS, 48)
+font = latin_font or ImageFont.load_default()
 image = Image.new("RGB", (1600, 1000), "white")
 draw = ImageDraw.Draw(image)
-font = ImageFont.truetype("C:/Windows/Fonts/arial.ttf", 48)
 draw.text((70, 120), "Sample B: NiFe2O4 prepared at 500 C", font=font, fill="black")
 draw.text((70, 210), "for 2 hours using nickel and iron salts.", font=font, fill="black")
 image.save(directory / "scanned.pdf", "PDF", resolution=120)
@@ -52,9 +86,12 @@ draw.text((70, 120), "Supporting Information", font=font, fill="black")
 draw.text((70, 210), "Synthetic preparation details for sample B.", font=font, fill="black")
 image.save(directory / "scanned-si.pdf", "PDF", resolution=120)
 
-image = Image.new("RGB", (1600, 1000), "white")
-draw = ImageDraw.Draw(image)
-font = ImageFont.truetype("C:/Windows/Fonts/msyh.ttc", 64)
-draw.text((70, 120), "样品加热两小时", font=font, fill="black")
-draw.text((70, 240), "Sample B prepared at 500 C for 2 hours.", font=ImageFont.truetype("C:/Windows/Fonts/arial.ttf", 48), fill="black")
-image.save(directory / "scanned-cn.pdf", "PDF", resolution=120)
+cjk_font = pick_font(CJK_FONTS, 64)
+if cjk_font:
+    image = Image.new("RGB", (1600, 1000), "white")
+    draw = ImageDraw.Draw(image)
+    draw.text((70, 120), "样品加热两小时", font=cjk_font, fill="black")
+    draw.text((70, 240), "Sample B prepared at 500 C for 2 hours.", font=font, fill="black")
+    image.save(directory / "scanned-cn.pdf", "PDF", resolution=120)
+
+print(json.dumps({"latin": latin_font is not None, "cjk": cjk_font is not None}))
