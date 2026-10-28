@@ -4,6 +4,9 @@ node_modules/
 .env
 .env.*
 !.env.example
-data/
+data/*
+!data/README.md
+reports/
+.workbuddy-ai/
 *.log
 .npmrc

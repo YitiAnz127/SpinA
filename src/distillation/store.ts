@@ -5,6 +5,7 @@ import { resolve, relative, sep, isAbsolute } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { PaperIdentity, Draft, Verification, SourceDocument, Fact } from './schema.ts';
 import { deriveMetalElements, preparationVariables } from './schema.ts';
+import { isExtractionIssue, isSourceLimitationIssue, issueText, missingInformation, sourceLimitations, sourceInformationMessages, type MissingInformation } from './missing-information.ts';
 
 export interface PublishedRecord {
   schema_version: 1;
@@ -32,9 +33,50 @@ export interface RunState {
   message: string;
 }
 
+export interface RecordReference {
+  paper_id: string;
+  version: 'verified' | 'uncertain';
+  revision: number;
+  verified_at: string;
+}
+/** Exact snapshots of both stored versions, including index-only changes with unchanged revision/time. */
+export interface PaperState {
+  paper_id: string;
+  verified: string | null;
+  uncertain: string | null;
+}
+export interface ExperimentSearchOptions {
+  includeUncertain?: boolean;
+  limit?: number;
+  offset?: number;
+  match?: 'exact' | 'superset';
+}
+interface ExperimentSearchResult {
+  paper: PaperIdentity;
+  record_ref: RecordReference;
+  sample_id: string;
+  phase_id: string;
+  sample?: string;
+  metal_elements: string[];
+  certainty: 'verified' | 'uncertain';
+  possible: boolean;
+  method_summary?: { text: string | null; status: Fact['status']; source_sample_id: string; note?: string };
+  missing_information?: MissingInformation[];
+  source_limitations?: MissingInformation[];
+  issues?: string[];
+  notes?: string[];
+  review_notes?: string[];
+}
+
 type DeliveryInput = Pick<PublishedRecord, 'paper' | 'sources' | 'draft' | 'match_entries'> & Partial<Pick<PublishedRecord, 'verification' | 'verification_status' | 'uncertainties' | 'candidate_match_entries'>>;
 /** Shared by the reader and verifier so neither silently loses preparation constraints. */
 export function deliveryRecord(record: DeliveryInput) {
+  const sourceMessages = sourceInformationMessages(record);
+  const knownIssues = new Set((record.verification?.issues ?? []).map(issueText));
+  const reviewNotes = [...new Set([
+    ...(record.uncertainties ?? []).filter(message => !sourceMessages.has(message) && !knownIssues.has(message)),
+    ...(record.verification?.issues ?? []).filter(issue => issue.resolution_status === 'unresolved' && !isExtractionIssue(issue) && !isSourceLimitationIssue(issue)).map(issueText),
+  ])];
   const value = (fact: Fact, keepNote = false) => {
     if (fact.status === 'not_reported') return keepNote ? { status: fact.status, ...(fact.note ? { note: fact.note } : {}) } : undefined;
     const raw = fact.raw ?? fact.value;
@@ -50,7 +92,9 @@ export function deliveryRecord(record: DeliveryInput) {
   }
   return {
     paper: record.paper,
-    ...(record.verification_status === 'uncertain' ? { status: 'uncertain', issues: record.uncertainties ?? [] } : {}),
+    ...(record.verification_status === 'uncertain' ? { status: 'uncertain',
+      issues: (record.verification?.issues ?? []).filter(isExtractionIssue).map(issueText) } : {}),
+    ...(reviewNotes.length ? { review_notes: reviewNotes } : {}),
     sources: record.sources.map(source => ({ id: source.id, path: source.path })),
     samples: record.draft.samples.filter(sample => relevant.has(sample.local_id)).map(sample => {
       const pages = new Map<string, { source: string; page: number }>();
@@ -64,10 +108,14 @@ export function deliveryRecord(record: DeliveryInput) {
       };
       const variables = preparationVariables(sample);
       collect([sample.phases, sample.method, sample.materials, sample.steps, variables]);
-      const issues = [...new Set([...sample.unresolved_questions, ...(record.verification?.issues ?? [])
-        .filter(issue => issue.resolution_status !== 'resolved' && (issue.sample_local_id === null || issue.sample_local_id === sample.local_id))
-        .filter(issue => issue.affects_matching || /(?:^|\.)(?:method|materials|steps)(?:\.|\[|$)/.test(issue.field_path))
-        .map(issue => `${issue.field_path}: ${issue.proposed_correction || issue.current_value}`)])];
+      const gaps = missingInformation(record, new Set([sample.local_id]));
+      const scope = new Set([sample.local_id]);
+      const limitations = sourceLimitations(record, scope);
+      const scopedSourceMessages = sourceInformationMessages(record, scope);
+      const issues = [...new Set((record.verification?.issues ?? [])
+        .filter(issue => isExtractionIssue(issue) && (issue.sample_local_id === null || scope.has(issue.sample_local_id)))
+        .map(issueText))];
+      const notes = sample.unresolved_questions.filter(message => !scopedSourceMessages.has(message) && !issues.includes(message));
       return nonempty({
         id: sample.local_id, name: sample.name,
         state: sample.material_state === 'as_prepared' ? undefined : sample.material_state,
@@ -85,7 +133,8 @@ export function deliveryRecord(record: DeliveryInput) {
           text: step.description.raw && step.description.raw !== step.operation.raw ? value(step.description, true) : undefined,
           conditions: step.conditions.map(condition => nonempty({ name: condition.name, value: value(condition.fact, true) })),
         })),
-        shared_from: sample.shared_from, pages: [...pages.values()], issues,
+        shared_from: sample.shared_from, pages: [...pages.values()], missing_information: gaps,
+        source_limitations: limitations, issues, notes,
       });
     }),
   };
@@ -141,9 +190,18 @@ export class ExperimentStore {
     return new ExperimentStore(root, directory, true);
   }
 
-  getPaper(paperId: string): PublishedRecord | null {
+  getPaper(paperId: string, version: 'preferred' | RecordReference['version'] = 'preferred'): PublishedRecord | null {
+    if (version === 'uncertain') return this.getUncertainPaper(paperId);
     const row = this.db.prepare('SELECT record_json FROM papers WHERE paper_id = ?').get(paperId) as { record_json: string } | undefined;
-    return row ? JSON.parse(row.record_json) as PublishedRecord : this.getUncertainPaper(paperId);
+    return row ? JSON.parse(row.record_json) as PublishedRecord : version === 'preferred' ? this.getUncertainPaper(paperId) : null;
+  }
+
+  getReferencedPaper(ref: RecordReference): PublishedRecord {
+    const record = this.getPaper(ref.paper_id, ref.version);
+    if (!record || record.revision !== ref.revision || record.verified_at !== ref.verified_at) {
+      throw new Error('检索版本已更新或不可用，请重新检索后展开；不会自动读取其他版本');
+    }
+    return record;
   }
 
   getUncertainPaper(paperId: string): PublishedRecord | null {
@@ -152,44 +210,96 @@ export class ExperimentStore {
     return row ? JSON.parse(row.record_json) as PublishedRecord : null;
   }
 
-  searchByElements(metals: string[], includeUncertain = true, limit = 20) {
-    const key = [...new Set(metals)].sort().join('|');
+  getPaperState(paperId: string): PaperState {
+    const query = "SELECT 'verified' AS version, record_json FROM papers WHERE paper_id = ?" +
+      (this.hasUncertainTable ? " UNION ALL SELECT 'uncertain' AS version, record_json FROM uncertain_papers WHERE paper_id = ?" : '');
+    const rows = this.db.prepare(query).all(...(this.hasUncertainTable ? [paperId, paperId] : [paperId])) as { version: 'verified' | 'uncertain'; record_json: string }[];
+    const state: PaperState = { paper_id: paperId, verified: null, uncertain: null };
+    for (const row of rows) state[row.version] = row.record_json;
+    return state;
+  }
+
+  searchByElements(metals: string[], options: ExperimentSearchOptions = {}) {
+    const { includeUncertain = true, limit = 20, offset = 0, match = 'exact' } = options;
+    const elements = [...new Set(metals)].sort();
+    const key = elements.join('|');
     if (!metals.length || deriveMetalElements([...new Set(metals)].sort().join(''))?.join('|') !== key) throw new Error('请提供有效的金属元素符号集合');
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error('limit 必须为 1–100');
-    const rows = this.db.prepare('SELECT record_json FROM papers ORDER BY paper_id').all() as { record_json: string }[];
-    if (includeUncertain && this.hasUncertainTable) rows.push(...this.db.prepare('SELECT record_json FROM uncertain_papers ORDER BY paper_id').all() as { record_json: string }[]);
-    const results = [];
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('offset 必须为非负安全整数');
+    if (match !== 'exact' && match !== 'superset') throw new Error('match 必须为 exact 或 superset');
+    const rows = this.db.prepare("SELECT record_json, 'verified' AS version FROM papers ORDER BY paper_id").all() as { record_json: string; version: RecordReference['version'] }[];
+    if (includeUncertain && this.hasUncertainTable) rows.push(...this.db.prepare("SELECT record_json, 'uncertain' AS version FROM uncertain_papers ORDER BY paper_id").all() as typeof rows);
+    const exact: ExperimentSearchResult[] = [], related: ExperimentSearchResult[] = [];
     for (const row of rows) {
       const record = JSON.parse(row.record_json) as PublishedRecord;
       const unresolved = record.verification.issues.filter(issue => issue.resolution_status !== 'resolved');
-      const issueText = (issue: Verification['issues'][number]) => `${issue.field_path}: ${issue.proposed_correction || issue.current_value}`;
+      const sourceMessages = sourceInformationMessages(record);
       const knownIssueMessages = new Set(unresolved.map(issueText));
-      const paperIssues = (record.uncertainties ?? []).filter(message => !knownIssueMessages.has(message));
+      const reviewNotes = (record.uncertainties ?? []).filter(message => !knownIssueMessages.has(message) && !sourceMessages.has(message));
       const seen = new Set<string>();
       const entries = [...record.match_entries.map(entry => ({ ...entry, possible: false })), ...(includeUncertain ? (record.candidate_match_entries ?? []).map(entry => ({ ...entry, possible: true })) : [])];
       for (const entry of entries) {
         const identity = `${entry.sample_local_id}:${entry.phase_local_id}`;
-        if (entry.element_key !== key || seen.has(identity)) continue;
+        const isExact = entry.element_key === key;
+        const isRelated = entry.metal_elements.length > elements.length && elements.every(element => entry.metal_elements.includes(element));
+        if ((!isExact && !isRelated) || seen.has(identity)) continue;
         seen.add(identity);
         const scope = new Set<string>();
         let sample = record.draft.samples.find(sample => sample.local_id === entry.sample_local_id);
+        let methodSummary: ExperimentSearchResult['method_summary'];
         while (sample && !scope.has(sample.local_id)) {
           scope.add(sample.local_id);
+          const method = sample.method;
+          if (!methodSummary && (method.status !== 'not_reported' || method.raw || method.value !== null || method.note)) {
+            methodSummary = { text: method.raw ?? (typeof method.value === 'string' ? method.value : null),
+              status: method.status, source_sample_id: sample.local_id, ...(method.note ? { note: method.note } : {}) };
+          }
           sample = record.draft.samples.find(parent => parent.local_id === sample!.shared_from);
         }
-        const issues = [...new Set([
-          ...record.draft.samples.filter(sample => scope.has(sample.local_id)).flatMap(sample => sample.unresolved_questions),
-          ...unresolved.filter(issue => issue.sample_local_id === null || scope.has(issue.sample_local_id)).map(issueText),
+        const scopedSourceMessages = sourceInformationMessages(record, scope);
+        const issues = [...new Set(unresolved.filter(issue => isExtractionIssue(issue) && (issue.sample_local_id === null || scope.has(issue.sample_local_id))).map(issueText))];
+        const notes = [...new Set(record.draft.samples.filter(sample => scope.has(sample.local_id))
+          .flatMap(sample => sample.unresolved_questions).filter(message => !scopedSourceMessages.has(message) && !issues.includes(message)))];
+        const gaps = missingInformation(record, scope);
+        const limitations = sourceLimitations(record, scope);
+        const scopedReviewNotes = [...new Set([...reviewNotes,
+          ...unresolved.filter(issue => !isExtractionIssue(issue) && !isSourceLimitationIssue(issue) && (issue.sample_local_id === null || scope.has(issue.sample_local_id))).map(issueText),
         ])];
-        results.push({ paper: record.paper, sample_id: entry.sample_local_id, phase_id: entry.phase_local_id,
+        (isExact ? exact : related).push({ paper: record.paper,
+          record_ref: { paper_id: record.paper.paper_id, version: row.version, revision: record.revision, verified_at: record.verified_at },
+          sample_id: entry.sample_local_id, phase_id: entry.phase_local_id,
           sample: record.draft.samples.find(sample => sample.local_id === entry.sample_local_id)?.name,
-          metal_elements: entry.metal_elements, certainty: record.verification_status ?? 'verified', possible: entry.possible,
-          ...(record.verification_status === 'uncertain' ? { issues, ...(paperIssues.length ? { paper_issues: paperIssues } : {}) } : {}),
+          metal_elements: entry.metal_elements, certainty: row.version, possible: entry.possible,
+          ...(methodSummary ? { method_summary: methodSummary } : {}),
+          ...(gaps.length ? { missing_information: gaps } : {}),
+          ...(limitations.length ? { source_limitations: limitations } : {}),
+          ...(issues.length ? { issues } : {}),
+          ...(notes.length ? { notes } : {}),
+          ...(scopedReviewNotes.length ? { review_notes: scopedReviewNotes } : {}),
         });
-        if (results.length >= limit) return results;
       }
     }
-    return results;
+    const compare = (a: ExperimentSearchResult, b: ExperimentSearchResult) =>
+      a.paper.paper_id.localeCompare(b.paper.paper_id) ||
+      Number(a.certainty === 'uncertain') - Number(b.certainty === 'uncertain') ||
+      a.sample_id.localeCompare(b.sample_id) || a.phase_id.localeCompare(b.phase_id);
+    exact.sort(compare); related.sort(compare);
+    const matches = match === 'exact' ? exact : related;
+    const results = matches.slice(offset, offset + limit);
+    const next = offset + results.length;
+    const sets = new Map<string, { metal_elements: string[]; total: number }>();
+    for (const row of related) {
+      const key = [...row.metal_elements].sort().join('|');
+      const group = sets.get(key) ?? { metal_elements: [...row.metal_elements].sort(), total: 0 };
+      group.total++; sets.set(key, group);
+    }
+    return {
+      metal_elements: elements, match, total: matches.length, offset, limit,
+      has_more: next < matches.length, next_offset: next < matches.length ? next : null, results,
+      related: { total: related.length, uncertain: related.filter(row => row.certainty === 'uncertain').length,
+        possible: related.filter(row => row.possible).length,
+        metal_sets: [...sets.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([, group]) => group) },
+    };
   }
 
   createRun(paperId: string): RunState {
@@ -224,11 +334,11 @@ export class ExperimentStore {
     await rename(temporary, destination);
   }
 
-  publish(record: PublishedRecord, expectedRevision: number): void {
+  publish(record: PublishedRecord, expected: PaperState): void {
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      const current = this.getPaper(record.paper.paper_id);
-      if ((current?.revision ?? 0) !== expectedRevision) throw new Error('该论文已被另一个任务更新，请重新蒸馏当前版本');
+      const current = this.getPaperState(record.paper.paper_id);
+      if (expected?.paper_id !== current.paper_id || current.verified !== expected.verified || current.uncertain !== expected.uncertain) throw new Error('该论文已被另一个任务更新，请重新蒸馏当前版本');
       if (record.verification_status === 'uncertain') {
         this.db.prepare('INSERT INTO uncertain_papers (paper_id, record_json) VALUES (?, ?) ON CONFLICT(paper_id) DO UPDATE SET record_json=excluded.record_json').run(record.paper.paper_id, JSON.stringify(record));
         this.db.exec('COMMIT');

@@ -133,13 +133,13 @@ export class VerificationAgent {
   async verify(paper: PaperIdentity, sources: SourceDocument[], draft: Draft, signal?: AbortSignal, reviewNotes: DraftReviewNote[] = [], previousReview?: Verification): Promise<Verification> {
     return parseVerification(await this.call({
       stage: 'verify', system: await systemPrompt('verify', CompactVerificationSchema, previousReview
-        ? '只核验上一轮已确认的问题是否已解决，不寻找新的遗漏'
+        ? '对照当前草稿重新判断样品状态，追踪旧问题并检查本次修正的关联影响'
         : '仅核验匹配与制备所需事实'),
       input: JSON.stringify({
         paper, sources, draft, reader_view: deliveryRecord({ paper, sources: sourceManifest(sources), draft, match_entries: [] }), review_notes: reviewNotes,
         ...(previousReview ? {
           previous_verification: previousReview,
-          focus: '本轮只核验 previous_verification.issues 里的每个问题在当前草稿中是否已解决：已解决就从 issues 中移除，仍未解决则保留；不要新增未被上一轮指出的问题。source_identity、coverage、samples 沿用上一轮结论。',
+          focus: '逐条检查 previous_verification.issues 在当前草稿中是否已解决：已解决就移除，未解决则保留。根据当前草稿重新判断 source_identity、coverage 和每个样品的 has_confirmed_errors、has_unresolved_issues、can_match，不能复制历史标志。检查本次修正及其共用流程、分支和匹配的关联影响；发现修正引入的实质错误或遗漏也要报告。所有判断在本次核验中完成，不额外建立第二份抽取结果。',
         } : {}),
       }), signal, images: pageImages(sources, imagePageKeys(draft, reviewNotes)),
     }));

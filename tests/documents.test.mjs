@@ -144,6 +144,6 @@ test('native tool distills through DeepSeek and independently verifies through P
     assert.deepEqual(stored.details.samples[0].phases[0].metals, ['Fe', 'Ni']);
     assert.equal(stored.details.verification, undefined);
     const found=await tools.get('search_spinel_experiments').execute('search',{metal_elements:['Ni','Fe']},undefined,undefined,ctx);
-    assert.equal(found.details[0].certainty,'verified');assert.equal(found.details[0].possible,false);
+    assert.equal(found.details.results[0].certainty,'verified');assert.equal(found.details.results[0].possible,false);
   } finally { await cleanup(root); }
 });

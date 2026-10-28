@@ -23,7 +23,7 @@
 
 - 修正已确认的遗漏、错配、继承错误、字段归属错误
 - 补齐核验指出缺失的步骤或原料引用（`material_refs` 必须指向已有原料的 `local_id`）
-- 拆分分支时用 `add_samples`，新增样品必须是**完整样品对象**（含 `local_id`/`name`/`aliases`/`material_state`/`nominal_composition`/`measured_composition`/`phases`/`method`/`materials`/`steps`/`shared_from`/`unresolved_questions`），并继承父模板已核验的共同前处理
+- 拆分分支时用 `add_samples`，按下方实际 JSON Schema 提供新增样品：必须包含 `local_id`、`name`、`material_state` 和 `phases`，按需提供方法、原料、步骤、变量及 `shared_from`。不添加 schema 外的历史字段；用 `shared_from` 继承父模板已核验的共同前处理
 
 ## 禁止
 

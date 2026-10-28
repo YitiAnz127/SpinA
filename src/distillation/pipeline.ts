@@ -3,6 +3,7 @@ import { readSources, resolvePaper, type DistillInput } from './documents.ts';
 import { ExperimentStore, sourceManifest, deliveryRecord, type PublishedRecord, type RunState } from './store.ts';
 import { derivePhaseMetalElements, draftReviewNotes, validateDraft, validateEvidence } from './schema.ts';
 import type { Draft, DraftReviewNote, SourceDocument, Verification } from './schema.ts';
+import { isSourceLimitationIssue } from './missing-information.ts';
 
 export interface PipelineOptions {
   signal?: AbortSignal;
@@ -26,6 +27,12 @@ function verificationStructureChecks(review: Verification, draft: Draft, sources
   for (const issue of review.issues) {
     if (issue.sample_local_id !== null && !ids.includes(issue.sample_local_id)) errors.push('核验问题引用了未知样品 ID');
     errors.push(...validateEvidence(issue.source_evidence, sources, false));
+    if (issue.resolution_status === 'confirmed_error' && issue.action === 'source_limit') errors.push('核验报告不能把已确认抽取错误标为来源限制');
+  }
+  for (const sample of review.samples) {
+    const confirmed = review.issues.filter(issue => issue.resolution_status === 'confirmed_error');
+    if (sample.has_confirmed_errors && !confirmed.some(issue => issue.sample_local_id === null || issue.sample_local_id === sample.sample_local_id)) errors.push(`核验样品 ${sample.sample_local_id} 的错误标志缺少本轮问题依据`);
+    if (!sample.has_confirmed_errors && confirmed.some(issue => issue.sample_local_id === sample.sample_local_id)) errors.push(`核验样品 ${sample.sample_local_id} 的错误标志与本轮问题矛盾`);
   }
   return errors;
 }
@@ -39,12 +46,32 @@ function verificationChecks(review: Verification, draft: Draft, sources: SourceD
   return errors;
 }
 
+function localReference<T extends { local_id: string }>(entries: T[], key: string | undefined): T | undefined {
+  return entries.find(entry => entry.local_id === key) ?? (key && /^\d+$/.test(key) ? entries[Number(key)] : undefined);
+}
+
+/** Resolve known sample/phase IDs or array indices; unresolved paths retain the broader issue scope. */
+function issueTargetsPhase(issue: Verification['issues'][number], draft: Draft, sample: Draft['samples'][number], phaseId: string): boolean {
+  if (issue.sample_local_id !== null && issue.sample_local_id !== sample.local_id) return false;
+  const fields = issue.field_path.replace(/\[["']?([^"'\[\]]+)["']?\]/g, '.$1').split('.');
+  const sampleAt = fields.indexOf('samples'), phaseAt = fields.indexOf('phases');
+  if (issue.sample_local_id === null && sampleAt >= 0) {
+    const target = localReference(draft.samples, fields[sampleAt + 1]);
+    if (target && target.local_id !== sample.local_id) return false;
+  }
+  const target = phaseAt >= 0 ? localReference(sample.phases, fields[phaseAt + 1]) : undefined;
+  return !target || target.local_id === phaseId;
+}
+
 export function matchingEntries(draft: Draft, review: Verification, possible = false): PublishedRecord['match_entries'] {
+  if (review.source_identity !== 'confirmed' || !['original_experiments', 'insufficient_sources'].includes(draft.assessment)) return [];
   return draft.samples.flatMap(sample => {
     const verdict = review.samples.find(verdict => verdict.sample_local_id === sample.local_id);
-    const blocked = review.issues.some(issue => issue.resolution_status !== 'resolved' && issue.affects_matching && (issue.sample_local_id === null || issue.sample_local_id === sample.local_id));
-    if ((!possible && (!verdict?.can_match || blocked)) || sample.material_state === 'intermediate' || sample.material_state === 'unspecified') return [];
+    if ((!possible && !verdict?.can_match) || sample.material_state === 'intermediate' || sample.material_state === 'unspecified') return [];
     return sample.phases.flatMap(phase => {
+      const blocked = review.issues.some(issue => issue.affects_matching && issue.resolution_status !== 'resolved' &&
+        (!possible || issue.resolution_status === 'confirmed_error') && issueTargetsPhase(issue, draft, sample, phase.local_id));
+      if (blocked) return [];
       const identity = String(phase.identity.value).toLowerCase().trim();
       const spinelIdentity = ['spinel', 'normal_spinel', 'inverse_spinel', 'oxyspinel', 'spinel-type structure', 'spinel type structure'].includes(identity);
       if (phase.role !== 'target_spinel' || (!possible && (phase.identity.status !== 'reported' || !spinelIdentity))) return [];
@@ -64,10 +91,10 @@ interface CheckedCandidate {
 }
 
 // 疑惑只标记"需要再检查"的实质问题：已确认错误，或该修而没修完的问题。
-// 原文未报告、外文献未取得（source_limit）是如实保留的信息缺口，不算疑惑。
+// 原文未报告、含糊或自身冲突（source_limit）直接在回答中保留，不算抽取疑惑。
 const doubts = (review: Verification) =>
   review.issues.some(issue => issue.resolution_status === 'confirmed_error' ||
-    (issue.resolution_status === 'unresolved' && issue.action === 'repair')) ||
+    (issue.resolution_status === 'unresolved' && !isSourceLimitationIssue(issue))) ||
   review.samples.some(sample => sample.has_confirmed_errors);
 const repairableIssue = (issue: Verification['issues'][number]) => issue.resolution_status !== 'resolved' && (issue.resolution_status === 'confirmed_error' || issue.action !== 'source_limit');
 const needsRepair = (review: Verification) => review.issues.some(repairableIssue) || review.samples.some(sample => sample.has_confirmed_errors ||
@@ -99,6 +126,7 @@ export async function runDistillation(root: string, input: DistillInput, modelCa
   };
   let lastResponse: { stage: string; response: string } | undefined;
   let repairAttempts = initialRepairAttempts;
+  let publicationStarted = false;
   let fallback: ((reason?: string) => Promise<RunState>) | undefined;
   const call: ModelCall = async request => {
     progress(request.stage);
@@ -108,6 +136,7 @@ export async function runDistillation(root: string, input: DistillInput, modelCa
     return response;
   };
   try {
+    const expectedState = store.getPaperState(input.paper_id);
     const previous = store.getPaper(input.paper_id);
     const seed = options.seedUncertain ? store.getUncertainPaper(input.paper_id) : null;
     if (options.seedUncertain && !seed) throw new Error('没有可继续定点修正的疑惑版本');
@@ -138,25 +167,29 @@ export async function runDistillation(root: string, input: DistillInput, modelCa
     let pendingFeedback = Boolean(options.requireFeedbackRepair && options.reviewFeedback);
     const publish = async (candidate: CheckedCandidate, uncertain: boolean, extraReason?: string) => {
       options.signal?.throwIfAborted();
+      publicationStarted = true;
       const uncertainties = uncertain ? [...new Set([
-        ...candidate.review.issues.filter(issue => issue.resolution_status !== 'resolved').map(issue => `${issue.field_path}: ${issue.proposed_correction || issue.current_value}`),
+        ...candidate.review.issues.filter(issue => issue.resolution_status !== 'resolved' && !isSourceLimitationIssue(issue)).map(issue => `${issue.field_path}: ${issue.proposed_correction || issue.current_value}`),
         ...candidate.errors, ...(extraReason ? [extraReason] : []),
         ...(candidate.round !== repairAttempts ? [`选用第${candidate.round}轮已核验版本；后续版本未改善或未能完成核验`] : []),
       ])] : [];
       if (uncertain && !uncertainties.length) uncertainties.push('核验仍存在未解决问题，使用前需复核');
       const matches = matchingEntries(candidate.draft, candidate.review);
+      const possibleMatches = matchingEntries(candidate.draft, candidate.review, true)
+        .filter(entry => !matches.some(match => match.sample_local_id === entry.sample_local_id && match.phase_local_id === entry.phase_local_id));
       const record: PublishedRecord = {
         schema_version: 1, paper, revision: (previous?.revision ?? 0) + 1,
         verified_at: new Date().toISOString(), verified_by: options.modelLabel ?? 'configured-model',
         verification_status: uncertain ? 'uncertain' : 'verified', repair_rounds: repairAttempts,
         ...(options.distillationModelLabel ? { distilled_by: options.distillationModelLabel } : {}),
         sources: sourceManifest(sources), draft: candidate.draft, verification: candidate.review, match_entries: matches,
-        ...(uncertain ? { uncertainties, candidate_match_entries: matchingEntries(candidate.draft, candidate.review, true).filter(entry => !matches.some(match => match.sample_local_id === entry.sample_local_id && match.phase_local_id === entry.phase_local_id)) } : {}),
+        ...(uncertain ? { uncertainties } : {}),
+        ...(possibleMatches.length ? { candidate_match_entries: possibleMatches } : {}),
       };
       await store.saveArtifact(run, 'selection.json', { repair_attempts: repairAttempts, selected_round: candidate.round, score: candidate.score, status: record.verification_status });
       await store.saveArtifact(run, 'record.json', deliveryRecord(record));
       options.signal?.throwIfAborted();
-      store.publish(record, previous?.revision ?? 0);
+      store.publish(record, expectedState);
       return finish(uncertain ? 'published_uncertain' : 'published', uncertain ? `已入库 ${candidate.draft.samples.length} 条样品记录，标记疑惑，可检索；修正 ${repairAttempts} 次` : `已发布 ${candidate.draft.samples.length} 条样品记录、${matches.length} 条目标相匹配项；修正 ${repairAttempts} 次`);
     };
     fallback = async reason => best ? publish(best, true, reason) : finish('needs_review', '修正已达上限，但没有来源已确认且结构可用的版本，未入库');
@@ -168,19 +201,15 @@ export async function runDistillation(root: string, input: DistillInput, modelCa
       const reviewNotes = draftReviewNotes(draft, sources);
       await store.saveArtifact(run, `review_notes_${round}.json`, reviewNotes);
       let review: Verification | null = null;
-      // 非目标论文（身份不符/非目标/无相关实验）不花核验额度：程序校验足够判断能否交付，核验只服务于要入库的实验抽取。
-      if (draft.assessment !== 'original_experiments') {
+      // Preserve non-experiment conclusions as run outcomes, never as unverified searchable samples.
+      // A source-limited draft with usable samples still passes through normal checks and verification.
+      if (['identity_mismatch', 'no_relevant_experiments'].includes(draft.assessment) || !draft.samples.length) {
         await store.saveArtifact(run, `checks_${round}.json`, errors);
-        // 三种非实验情况都如实入库（标疑惑、可检索），让每篇论文都有一个明确结果，而不是消失在 needs_review/skipped 里。
-        const reason = draft.assessment === 'insufficient_sources'
-          ? '原文资料不足（缺正文、SI 或关键方法段），未能完整抽取制备信息；如实入库供检索'
-          : draft.assessment === 'no_relevant_experiments'
-            ? '未发现本论文实际报告的相关制备实验；如实入库供检索'
-            : '论文身份存疑（标题/DOI/内容不一致），未能确认是本项目目标文献';
-        const review: Verification = { source_identity: 'ambiguous', coverage: 'incomplete', samples: [], issues: [], notes: [reason] };
-        // 已有确认版本时不用更弱的结果覆盖它。
-        if (previous?.verification_status === 'verified') return finish('needs_review', '已有来源已确认的版本，本次结果更弱，未覆盖');
-        return await publish({ draft, review, errors, notes: reviewNotes, round, score: 0 }, true, reason);
+        if (errors.length) return finish('needs_review', `草稿校验未通过：${errors.slice(0, 3).join('；')}；未发布实验记录`);
+        if (draft.assessment === 'no_relevant_experiments') return finish('skipped', '未发现本论文实际报告的相关制备实验；处理结论已保存，未发布实验记录');
+        return finish('needs_review', draft.assessment === 'identity_mismatch'
+          ? '论文身份存疑（标题/DOI/内容不一致）；未发布实验记录'
+          : '来源不足或没有可核验样品；处理结论已保存，未发布实验记录');
       }
       if (!errors.length) {
         review = await verifier.verify(paper, sources, draft, options.signal, reviewNotes, round > 0 ? previousReview : undefined);
@@ -229,7 +258,10 @@ export async function runDistillation(root: string, input: DistillInput, modelCa
   } catch (error) {
     const cancelled = !!options.signal?.aborted;
     if (lastResponse && !cancelled) await store.saveArtifact(run, 'last_model_output.json', lastResponse);
-    if (!cancelled && repairAttempts === maxRepairs && fallback) return await fallback(`第三次修正后的处理未完成：${(error as Error).message}`);
+    if (!cancelled && !publicationStarted && repairAttempts === maxRepairs && fallback) {
+      try { return await fallback(`修正后的处理未完成：${(error as Error).message}`); }
+      catch (publishError) { return finish('failed', (publishError as Error).message); }
+    }
     return finish(cancelled ? 'cancelled' : 'failed', cancelled ? '任务已取消，未覆盖已有记录' : (error as Error).message);
   } finally { store.close(); }
 }

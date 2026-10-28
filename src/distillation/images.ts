@@ -1,8 +1,9 @@
 import { spawn } from 'node:child_process';
 import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { realpathSync as realpath } from 'node:fs';
-import { basename, isAbsolute, relative, resolve, sep } from 'node:path';
+import { isAbsolute, relative, resolve, sep } from 'node:path';
 import type { SourceDocument } from './schema.ts';
+import { sourceVersion, sourcePageDirectory } from './source-version.ts';
 
 function within(root: string, path: string): void {
   const rel = relative(root, path);
@@ -18,15 +19,15 @@ export async function renderSourcePages(root: string, source: SourceDocument, si
   }
   // Text-only installations retain their existing behavior and cannot claim image evidence.
   if (!executable) return;
-  const pdf = resolve(root, source.path), info = await stat(pdf);
-  const directory = resolve(root, 'data/distillation/pages', basename(pdf, '.pdf'));
+  const pdf = resolve(root, source.path), version = await sourceVersion(root, pdf);
+  const directory = sourcePageDirectory(root, version);
   await mkdir(directory, { recursive: true });
   within(await realpath(root), await realpath(directory));
   const indexPath = resolve(directory, 'render.json');
-  let cached: { size: number; mtime_ms: number; pages: { number: number; image_path: string }[] } | undefined;
+  let cached: { pages: { number: number; image_path: string }[] } | undefined;
   try { cached = JSON.parse(await readFile(indexPath, 'utf8')); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-  if (!cached || cached.size !== info.size || cached.mtime_ms !== info.mtimeMs || cached.pages.length !== source.pages.length || !(await Promise.all(cached.pages.map(p => stat(resolve(root, p.image_path)).then(() => true, () => false)))).every(Boolean)) {
+  if (!cached || cached.pages.length !== source.pages.length || !(await Promise.all(cached.pages.map(p => stat(resolve(root, p.image_path)).then(() => true, () => false)))).every(Boolean)) {
     signal?.throwIfAborted();
     await new Promise<void>((done, fail) => {
       const child = spawn(executable!, ['-scale-to', '1800', '-png', pdf, resolve(directory, 'page')], { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'], signal });
@@ -41,8 +42,8 @@ export async function renderSourcePages(root: string, source: SourceDocument, si
       if (!file) throw new Error(`PDF页面渲染缺失：${source.path} 第${page.number}页`);
       return { number: page.number, image_path: relative(root, resolve(directory, file)).split(sep).join('/') };
     });
-    cached = { size: info.size, mtime_ms: info.mtimeMs, pages };
-    await writeFile(indexPath, JSON.stringify(cached, null, 2));
+    cached = { pages };
+    await writeFile(indexPath, JSON.stringify({ source_version: version, ...cached }, null, 2));
   }
   for (const page of source.pages) page.image_path = cached.pages.find(p => p.number === page.number)!.image_path;
 }

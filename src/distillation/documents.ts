@@ -47,7 +47,13 @@ export async function resolvePaper(root: string, input: DistillInput): Promise<{
 
 export async function readSources(root: string, inputs: SourceInput[], signal?: AbortSignal, options: { renderImages?: boolean; allowSI?: boolean } = {}): Promise<SourceDocument[]> {
   if (!inputs.length || inputs.length > 8) throw new Error('一次论文任务需要 1–8 个正文／SI 文件');
-  const directory = await realpath(resolve(root, 'data/paper'));
+  let directory: string;
+  try {
+    directory = await realpath(resolve(root, 'data/paper'));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error('未找到 data/paper：请先创建该目录并放入要蒸馏的 PDF');
+    throw error;
+  }
   const projectRoot = realpath(root);
   const directoryRel = relative(projectRoot, directory);
   if (isAbsolute(directoryRel) || directoryRel === '..' || directoryRel.startsWith(`..${sep}`)) throw new Error('论文目录不能指向项目外部');

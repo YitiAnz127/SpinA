@@ -60,10 +60,82 @@ test('properly retained source limitations do not cause repeated model repair ca
       calls.push(request.stage);
       if (request.stage !== 'verify') return JSON.stringify(draft());
       const r = badReview(); r.samples[0].has_confirmed_errors = false; r.samples[0].has_unresolved_issues = true;
-      r.issues[0].resolution_status = 'unresolved'; r.issues[0].action = 'source_limit';
+      r.issues[0].resolution_status = 'unresolved'; r.issues[0].action = 'source_limit'; r.issues[0].issue_type = 'omission';
       return JSON.stringify(r);
     }, { readSources: fakeReadSources });
     assert.deepEqual(calls, ['distill', 'verify']); assert.equal(result.status, 'published');
+  } finally { await cleanup(root); }
+});
+
+test('usable preparation records publish with explicit gaps shown separately from doubts', async () => {
+  const root = await workspace(); const calls = [];
+  try {
+    const d = draft();
+    d.samples[0].variables = [{ name: 'treatment_duration', fact: { ...fact(null), note: 'Treatment duration was not reported.' } }];
+    const r = review(); r.coverage = 'incomplete'; r.samples[0].has_unresolved_issues = true;
+    r.issues = [{ ...badReview().issues[0], field_path: 'samples[0].steps.atmosphere', issue_type: 'omission',
+      resolution_status: 'unresolved', action: 'source_limit', proposed_correction: 'The source does not report an atmosphere.' }];
+    const result = await runDistillation(root, { ...paper, sources: [{ path: 'data/paper/test.pdf' }] }, async request => {
+      calls.push(request.stage); return JSON.stringify(request.stage === 'verify' ? r : d);
+    }, { readSources: fakeReadSources });
+    assert.equal(result.status, 'published');
+    assert.deepEqual(calls, ['distill', 'verify']);
+    const store = await ExperimentStore.openExisting(root);
+    try {
+      const stored = store.getPaper(paper.paper_id);
+      const row = store.searchByElements(['Ni', 'Fe']).results[0];
+      assert.equal(row.certainty, 'verified');
+      assert.ok(row.missing_information.some(gap => gap.message.includes('atmosphere')));
+      assert.ok(row.missing_information.some(gap => gap.message.includes('duration')));
+      assert.equal(row.issues, undefined);
+      const view = deliveryRecord(stored).samples[0];
+      assert.ok(view.missing_information.some(gap => gap.message.includes('atmosphere')));
+      assert.ok(view.missing_information.some(gap => gap.message.includes('duration')));
+      assert.equal(view.issues, undefined);
+      assert.equal(stored.draft.samples[0].variables[0].fact.status, 'not_reported');
+    } finally { store.close(); }
+  } finally { await cleanup(root); }
+});
+
+for (const issueType of ['source_conflict', 'numeric_error']) test(`a faithfully retained ${issueType} in the source publishes with a source limitation, not an extraction doubt`, async () => {
+  const root = await workspace(); const calls = [];
+  try {
+    const r = review(); r.samples[0].has_unresolved_issues = true;
+    r.issues = [{ ...badReview().issues[0], field_path: 'samples[0].steps.temperature', issue_type: issueType,
+      resolution_status: 'unresolved', action: 'source_limit', proposed_correction: 'Two source passages report contradictory temperatures.' }];
+    const result = await runDistillation(root, { ...paper, sources: [{ path: 'data/paper/test.pdf' }] }, async request => {
+      calls.push(request.stage); return JSON.stringify(request.stage === 'verify' ? r : draft());
+    }, { readSources: fakeReadSources });
+    assert.equal(result.status, 'published');
+    assert.deepEqual(calls, ['distill', 'verify']);
+    const store = await ExperimentStore.openExisting(root);
+    try {
+      const row = store.searchByElements(['Ni', 'Fe']).results[0];
+      assert.equal(row.issues, undefined);
+      assert.ok(row.source_limitations.some(issue => issue.message.includes('contradictory')));
+      assert.equal(row.missing_information, undefined);
+    } finally { store.close(); }
+  } finally { await cleanup(root); }
+});
+
+test('unclear source phase identity remains a possible match without labeling the whole record doubtful', async () => {
+  const root = await workspace(); const calls = [];
+  try {
+    const d = draft(); d.samples[0].phases[0].identity.status = 'ambiguous';
+    const r = review(); r.samples[0].can_match = false; r.samples[0].has_unresolved_issues = true;
+    r.issues = [{ ...badReview().issues[0], field_path: 'samples[0].phases[0].identity', issue_type: 'composition_or_phase_error',
+      affects_matching: true, resolution_status: 'unresolved', action: 'source_limit', proposed_correction: 'The paper does not clearly establish the target phase.' }];
+    const result = await runDistillation(root, { ...paper, sources: [{ path: 'data/paper/test.pdf' }] }, async request => {
+      calls.push(request.stage); return JSON.stringify(request.stage === 'verify' ? r : d);
+    }, { readSources: fakeReadSources });
+    assert.equal(result.status, 'published'); assert.deepEqual(calls, ['distill', 'verify']);
+    const store = await ExperimentStore.openExisting(root);
+    try {
+      const row = store.searchByElements(['Ni', 'Fe']).results[0];
+      assert.equal(row.certainty, 'verified'); assert.equal(row.possible, true);
+      assert.ok(row.source_limitations.some(issue => issue.message.includes('target phase')));
+      assert.deepEqual(store.searchByElements(['Ni', 'Fe'], { includeUncertain: false }).results, []);
+    } finally { store.close(); }
   } finally { await cleanup(root); }
 });
 
@@ -72,11 +144,11 @@ test('search attaches only sample and inherited issues instead of broadcasting a
   try {
     const d = draft(); d.samples.push({ ...structuredClone(d.samples[0]), local_id: 'sample_b', name: 'B' });
     const r = badReview(); r.samples[0].has_confirmed_errors = false; r.samples[0].can_match = true; r.samples[0].has_unresolved_issues = true;
-    r.samples.push({ ...r.samples[0], sample_local_id: 'sample_b' });
+    r.samples.push({ ...r.samples[0], sample_local_id: 'sample_b', has_confirmed_errors: true });
     r.issues[0] = { ...r.issues[0], sample_local_id: 'sample_b', resolution_status: 'confirmed_error', action: 'repair', proposed_correction: 'B-only limit' };
     r.issues.push({ ...r.issues[0], sample_local_id: null, proposed_correction: 'Shared paper limit' });
     await runDistillation(root, { ...paper, sources: [{ path: 'data/paper/test.pdf' }] }, async request => JSON.stringify(request.stage === 'verify' ? r : d), { readSources: fakeReadSources });
-    const store = await ExperimentStore.openExisting(root), results = store.searchByElements(['Fe', 'Ni']); store.close();
+    const store = await ExperimentStore.openExisting(root), results = store.searchByElements(['Fe', 'Ni']).results; store.close();
     assert.ok(results.find(row => row.sample_id === 'sample_a').issues.some(issue => issue.includes('Shared paper limit')));
     assert.ok(!results.find(row => row.sample_id === 'sample_a').issues.some(issue => issue.includes('B-only')));
     assert.ok(results.find(row => row.sample_id === 'sample_b').issues.some(issue => issue.includes('B-only')));
@@ -95,7 +167,7 @@ test('preparation errors do not downgrade a separately confirmed target metal se
     assert.equal(result.status, 'published_uncertain');
     const store = await ExperimentStore.openExisting(root), record = store.getUncertainPaper(paper.paper_id);
     assert.equal(record.match_entries.length, 1); assert.equal(record.match_entries[0].element_key, 'Fe|Ni');
-    assert.equal(store.searchByElements(['Fe', 'Ni'])[0].possible, false); store.close();
+    assert.equal(store.searchByElements(['Fe', 'Ni']).results[0].possible, false); store.close();
   } finally { await cleanup(root); }
 });
 
@@ -264,8 +336,8 @@ test('three unsuccessful repairs index an explicitly uncertain record and possib
     const store=await ExperimentStore.open(root),record=store.getPaper(paper.paper_id);
     assert.equal(record.verification_status,'uncertain');assert.equal(record.repair_rounds,3);
     assert.equal(record.match_entries.length,0);assert.equal(record.candidate_match_entries[0].element_key,'Fe|Ni');
-    const found=store.searchByElements(['Ni','Fe']);assert.equal(found.length,1);assert.equal(found[0].certainty,'uncertain');assert.equal(found[0].possible,true);assert.ok(found[0].issues.length);
-    assert.deepEqual(store.searchByElements(['Ni','Fe'],false),[]);
+    const found=store.searchByElements(['Ni','Fe']).results;assert.equal(found.length,1);assert.equal(found[0].certainty,'uncertain');assert.equal(found[0].possible,true);assert.ok(found[0].issues.length);
+    assert.deepEqual(store.searchByElements(['Ni','Fe'],{includeUncertain:false}).results,[]);
     assert.throws(()=>store.searchByElements(['O','Ni']),/金属元素/);store.close();
     const delivered=JSON.parse(await readFile(join(root,'data/distillation/runs',result.run_id,'record.json'),'utf8'));
     assert.equal(delivered.status,'uncertain');assert.ok(delivered.issues.length);assert.deepEqual(delivered.samples[0].phases[0].possible_metals,['Fe','Ni']);
@@ -307,7 +379,7 @@ test('an uncertain update remains searchable alongside the last confirmed versio
     const result=await runDistillation(root,input,async request=>JSON.stringify(request.stage==='verify'?badReview():draft()),{readSources:fakeReadSources});
     assert.equal(result.status,'published_uncertain');
     const store=await ExperimentStore.open(root);assert.equal(store.getPaper(paper.paper_id).verification_status,'verified');assert.equal(store.getPaper(paper.paper_id).revision,1);
-    assert.equal(store.getUncertainPaper(paper.paper_id).verification_status,'uncertain');assert.deepEqual(store.searchByElements(['Fe','Ni']).map(item=>item.certainty),['verified','uncertain']);store.close();
+    assert.equal(store.getUncertainPaper(paper.paper_id).verification_status,'uncertain');assert.deepEqual(store.searchByElements(['Fe','Ni']).results.map(item=>item.certainty),['verified','uncertain']);store.close();
   } finally {await cleanup(root);}
 });
 
@@ -455,7 +527,8 @@ test('compact records retain sample preparation ratios and amount bases without 
   const delivered = deliveryRecord({ paper, sources: [{ id: 'src_1', path: 'data/paper/test.pdf' }], draft: d, verification: review(), match_entries: [] });
   assert.deepEqual(delivered.samples[0].variables, [{ name: 'precursor_molar_ratio', value: { value: 'Ni:Fe = 1:2', note: 'Ni and Fe precursors, molar basis' } }]);
   assert.deepEqual(delivered.samples[0].materials[0].amount, { value: '0.4 mol', note: 'total metal precursors' });
-  assert.deepEqual(delivered.samples[0].issues, ['Calcination atmosphere was not reported.']);
+  assert.equal(delivered.samples[0].issues, undefined);
+  assert.deepEqual(delivered.samples[0].notes, ['Calcination atmosphere was not reported.']);
 });
 
 test('explicit check-only mode stops after two calls without automatic repairs', async () => {

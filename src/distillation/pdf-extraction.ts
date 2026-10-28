@@ -1,9 +1,10 @@
 import { spawn } from 'node:child_process';
 import { readFile, writeFile, mkdir, mkdtemp, rm, copyFile } from 'node:fs/promises';
 import { realpathSync as realpath } from 'node:fs';
-import { basename, isAbsolute, relative, resolve, sep } from 'node:path';
+import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { SourceDocument } from './schema.ts';
+import { sourceVersion, sourcePageDirectory } from './source-version.ts';
 
 interface PdfTools { python?: string; ocr_lang_path?: string; ocr_languages?: string }
 export async function pdfTools(root: string): Promise<PdfTools> {
@@ -49,6 +50,7 @@ function runTool(executable: string, args: string[], signal?: AbortSignal): Prom
 export async function extractPdf(root: string, pdf: string, signal?: AbortSignal): Promise<SourceDocument['pages'] | undefined> {
   const tools = await pdfTools(root);
   if (!tools.python) return undefined;
+  const version = await sourceVersion(root, pdf);
   const base = resolve(root, '.runtime/pdf-extraction');
   await mkdir(base, { recursive: true });
   await within(root, base);
@@ -79,7 +81,7 @@ export async function extractPdf(root: string, pdf: string, signal?: AbortSignal
           if (page.text) page.native_text = page.text;
           page.text = text; page.layout_text = text; page.extraction_method = 'tesseract';
         }
-        const directory = resolve(root, 'data/distillation/pages', basename(pdf, '.pdf'));
+        const directory = sourcePageDirectory(root, version);
         await mkdir(directory, { recursive: true });
         await within(root, directory);
         const saved = resolve(directory, `ocr-page-${page.number}.png`);

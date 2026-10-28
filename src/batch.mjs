@@ -2,16 +2,17 @@ import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ModelRuntime, ModelRegistry } from '@earendil-works/pi-coding-agent';
-import { ReadOnlyAuthStorage } from '../node_modules/@earendil-works/pi-coding-agent/dist/core/auth-storage.js';
+import { AuthStorage } from '../node_modules/@earendil-works/pi-coding-agent/dist/core/auth-storage.js';
 import { runDistillation } from './distillation/pipeline.ts';
 import { resolvePaper } from './distillation/documents.ts';
 import { imageContent } from './distillation/images.ts';
 import { ExperimentStore } from './distillation/store.ts';
 import { applyFocusedRepair, parseDraft, parseVerification } from './distillation/schema.ts';
 import { createDeepSeekCall, deepSeekConfig } from './distillation/deepseek.ts';
-import { createOpenAiCompatCall, openAiCompatConfig, OPENAI_COMPAT_LABEL } from './distillation/openai-compat.ts';
 import { SOL_POLICY, SOL_LABEL } from './model-policy.ts';
 import { quotaRetryDelay } from './batch-retry.mjs';
+import { batchModelKey, checkedExtraction, sameSourceVersions } from './batch-cache.ts';
+import { sourceVersion } from './distillation/source-version.ts';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const checkOnly = process.argv.includes('--check-only');
@@ -35,7 +36,11 @@ const directory = jobId ? resolve(extractionDirectory, 'jobs', jobId) : extracti
 await mkdir(directory, { recursive: true });
 const save = async (name, value) => { const path=resolve(directory,name);await writeFile(path+'.tmp',JSON.stringify(value,null,2)+'\n');await rename(path+'.tmp',path); };
 const load = async (path, fallback) => { try { return JSON.parse(await readFile(path, 'utf8')); } catch (error) { if (error.code === 'ENOENT') return fallback; throw error; } };
-const catalog = (await readFile(resolve(root, 'data/literature/selected-500.jsonl'), 'utf8')).split(/\r?\n/).filter(Boolean).map(JSON.parse);
+const catalog = await readFile(resolve(root, 'data/literature/selected-500.jsonl'), 'utf8')
+  .then(text => text.split(/\r?\n/).filter(Boolean).map(JSON.parse), error => {
+    if (error.code === 'ENOENT') throw Error('未找到 data/literature/selected-500.jsonl：批处理需要论文清单，每行一个 {"paper_id","doi","title"} JSON；单篇论文请用 /distill');
+    throw error;
+  });
 const queue = await load(resolve(directory, 'queue.json'), []);
 for (const item of queue) if (item.status === 'running' || item.status === 'claimed') item.status = 'pending';
 const selectedPapers = onlyIds ? catalog.filter(p => onlyIds.includes(p.paper_id)) : catalog.filter(p => Number(p.paper_id.slice(-4)) > after);
@@ -49,15 +54,13 @@ for (const paper of selectedPapers) if (!queue.some(item => item.paper_id === pa
 const workItems = onlyIds ? queue.filter(item => onlyIds.includes(item.paper_id)) : queue;
 if (onlyIds) for (const item of workItems) if (item.status !== 'already_published') item.status = 'pending';
 await save('queue.json', queue);
-const registry = new ModelRegistry(await ModelRuntime.create({ credentials: new ReadOnlyAuthStorage(), modelsStorePath: resolve(root, '.runtime/model-store.json') }));
+const registry = new ModelRegistry(await ModelRuntime.create({ credentials: AuthStorage.create(), modelsStorePath: resolve(root, '.runtime/model-store.json') }));
 const model = registry.find(SOL_POLICY.provider, SOL_POLICY.model);
-// 配了 OPENASI_API_KEY 就用 OpenAI 兼容端点做核验，不再依赖 ChatGPT OAuth 额度。
-const compat = openAiCompatConfig();
-const verifierLabel = compat ? OPENAI_COMPAT_LABEL(compat) : SOL_LABEL;
-if (!distillOnly && !compat && (!model || !registry.hasConfiguredAuth(model))) throw Error('请先在SpinA完成ChatGPT OAuth登录，或设置 OPENASI_API_KEY 使用兼容端点');
+const verifierLabel = SOL_LABEL;
+if (!distillOnly && (!model || !registry.hasConfiguredAuth(model))) throw Error('请先在SpinA完成ChatGPT OAuth登录');
 const concurrency = Number(process.env.SPINA_BATCH_CONCURRENCY ?? 2);
 if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 4) throw Error('SPINA_BATCH_CONCURRENCY 必须是 1–4 的整数');
-const control = { status: 'running', mode: distillOnly ? 'distill_only' : checkOnly ? 'check_existing_drafts' : repairExisting ? 'repair_existing_drafts' : 'distill_and_verify', model: verifierLabel, reasoning: compat ? compat.effort : SOL_POLICY.reasoning, distillation_model: `deepseek/${distillConfig.model}`, distillation_reasoning: distillConfig.effort, concurrency, current_paper: null, current_stage: null, active_papers: {}, updated_at: '', resume_at: null };
+const control = { status: 'running', mode: distillOnly ? 'distill_only' : checkOnly ? 'check_existing_drafts' : repairExisting ? 'repair_existing_drafts' : 'distill_and_verify', model: verifierLabel, reasoning: SOL_POLICY.reasoning, distillation_model: `deepseek/${distillConfig.model}`, distillation_reasoning: distillConfig.effort, concurrency, current_paper: null, current_stage: null, active_papers: {}, updated_at: '', resume_at: null };
 const emit = value => console.log(JSON.stringify(value));
 let snapshots=Promise.resolve();
 const snapshot = () => { control.updated_at = new Date().toISOString();const state={...structuredClone(control),counts:Object.fromEntries([...new Set(queue.map(x=>x.status))].map(s=>[s,queue.filter(x=>x.status===s).length]))},items=structuredClone(queue);snapshots=snapshots.then(async()=>{await save('state.json',state);await save('queue.json',items);});return snapshots; };
@@ -107,21 +110,19 @@ const processItem = async item => {
       item.status = 'source_unavailable'; item.message = error.message; item.finished_at = new Date().toISOString();
       await snapshot(); emit({ event: 'paper_finished', ...item }); return;
     }
-    const versions = await Promise.all(prepared.sources.map(async source => { const info = await stat(resolve(root, source.path)); return { path: source.path, size: info.size, mtime_ms: info.mtimeMs }; }));
+    const versions = await Promise.all(prepared.sources.map(source => sourceVersion(root, source.path)));
     const cachePath = resolve(directory, item.paper_id + '-calls.json');
     let cache = await load(cachePath, null);
     if (!cache && jobId && reuseDraft) cache = await load(resolve(extractionDirectory, item.paper_id + '-calls.json'), null);
-    cache ??= { source_versions: versions, requests: [] };
     let savedExtraction;
     if (reuseDraft) {
-      savedExtraction = await load(resolve(extractionDirectory, item.paper_id + '-distill-last.json'), null);
-      if (!savedExtraction || savedExtraction.metadata?.provider !== 'deepseek' || savedExtraction.metadata?.stop_reason !== 'stop' || typeof savedExtraction.output !== 'string') throw Error('没有可检查的完整 DeepSeek 草稿');
-      if (JSON.stringify(cache.source_versions) !== JSON.stringify(versions)) throw Error('来源已改变，不能复用旧草稿检查');
+      savedExtraction = checkedExtraction(await load(resolve(extractionDirectory, item.paper_id + '-distill-last.json'), null), cache, versions);
     }
-    if (JSON.stringify(cache.source_versions) !== JSON.stringify(versions)) cache = { source_versions: versions, requests: [] };
+    if (!sameSourceVersions(cache?.source_versions, versions)) cache = { source_versions: versions, requests: [] };
     let transientFailures = 0;
     while (true) {
       if (stopRequested || await stopFileRequested()) { stopRequested = true; item.status = 'pending'; return; }
+      if (!sameSourceVersions(versions, await Promise.all(prepared.sources.map(source => sourceVersion(root, source.path))))) throw Error('等待期间来源已改变，请重新启动任务；不会将旧缓存绑定到新来源');
     let resourceError = null;
     const call = async request => {
       if (distillOnly && request.stage !== 'distill') {
@@ -136,7 +137,7 @@ const processItem = async item => {
         return savedExtraction.output;
       }
       if (checkOnly && request.stage === 'repair') throw Error('只检查模式不执行修正');
-      const modelKey = request.stage === 'verify' ? verifierLabel : `deepseek/${distillConfig.model}:${distillConfig.effort}`;
+      const modelKey = batchModelKey(request.stage, verifierLabel, distillConfig);
       const cached = cache.requests.find(c => c.model_key === modelKey && c.stage === request.stage && c.system === request.system && c.input === request.input);
       if (cached) { emit({ paper_id: item.paper_id, stage: request.stage, event: 'reuse_verified_output' }); return cached.output; }
       const started = Date.now(); emit({ paper_id: item.paper_id, stage: request.stage, event: 'request_start', model_key: modelKey, images: request.images?.length ?? 0 });
@@ -144,8 +145,6 @@ const processItem = async item => {
       try {
         if (request.stage !== 'verify') {
           output = await createDeepSeekCall(root, distillConfig, { onResult: value => { metadata = value; } })(request);
-        } else if (compat) {
-          output = await createOpenAiCompatCall(root, compat, { onResult: value => { metadata = value; } })(request);
         } else {
           const text = request.system + request.input;
           const outputBudget = Math.min(SOL_POLICY.outputTokens, model.maxTokens);
@@ -159,14 +158,14 @@ const processItem = async item => {
       }
       catch (error) { resourceError = error.message; throw error; }
       metadata = { ...metadata, seconds: (Date.now() - started) / 1000 };
-      await save(`${item.paper_id}-${request.stage}-last.json`, { metadata, output }); emit({ paper_id: item.paper_id, stage: request.stage, event: 'request_end', ...metadata });
+      await save(`${item.paper_id}-${request.stage}-last.json`, { source_versions: versions, metadata, output }); emit({ paper_id: item.paper_id, stage: request.stage, event: 'request_end', ...metadata });
       if (request.stage === 'verify') parseVerification(output);
       else if (request.outputShape === 'patch') applyFocusedRepair(output, JSON.parse(request.input).draft);
       else parseDraft(output);
       cache.requests.push({ model_key: modelKey, stage: request.stage, system: request.system, input: request.input, output, metadata }); await save(item.paper_id+'-calls.json',cache);
       return output;
     };
-    const run = await runDistillation(root, { paper_id: item.paper_id }, call, { maxRepairs: (checkOnly || distillOnly) ? 0 : 2, focusedRepairs: false, modelLabel: verifierLabel, distillationModelLabel: `deepseek/${distillConfig.model}:${distillConfig.effort}`, onProgress: run => { control.active_papers[item.paper_id] = run.stage; control.current_paper = item.paper_id; control.current_stage = run.stage; control.run_id = run.run_id; void snapshot(); } });
+    const run = await runDistillation(root, { paper_id: item.paper_id }, call, { maxRepairs: (checkOnly || distillOnly) ? 0 : 3, focusedRepairs: false, modelLabel: verifierLabel, distillationModelLabel: reuseDraft ? `deepseek/${savedExtraction.metadata.model}:${savedExtraction.metadata.reasoning}` : `deepseek/${distillConfig.model}:${distillConfig.effort}`, onProgress: run => { control.active_papers[item.paper_id] = run.stage; control.current_paper = item.paper_id; control.current_stage = run.stage; control.run_id = run.run_id; void snapshot(); } });
     if (reuseDraft) {
       const provenanceStore = await ExperimentStore.open(root);
       try { await provenanceStore.saveArtifact(run, 'check-input.json', { mode: checkOnly ? 'check_existing_draft' : 'repair_existing_draft', original_output: `data/distillation/batch/${item.paper_id}-distill-last.json`, model: savedExtraction.metadata.model, reasoning: savedExtraction.metadata.reasoning, source_versions: versions, new_distillation_calls: 0 }); }

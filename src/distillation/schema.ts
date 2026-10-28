@@ -102,10 +102,10 @@ export interface PaperIdentity { paper_id: string; doi: string; title: string }
 const omittedFields = new Set(['aliases', 'variables', 'nominal_composition', 'measured_composition', 'purity',
   'formula', 'method', 'materials', 'steps', 'shared_from', 'unresolved_questions', 'notes', 'description',
   'amount', 'concentration', 'conditions', 'material_refs', 'checks', 'source_gaps', 'expandable_fields', 'missing_or_uncertain']);
-const excludedFields = new Set(['aliases', 'nominal_composition', 'measured_composition', 'purity', 'description', 'expandable_fields', 'missing_or_uncertain']);
-// Legacy records also put characterization results in variables. Keep only preparation inputs.
-const preparationVariableName = /ratio|proportion|mass_fraction|geometric_area|thickness|catalyst_load|loading|duration|temperature|time|cycles|repetition|atmosphere|pressure|concentration|dissolved_|^pH$|^x$|^series_x_range$/i;
-export const preparationVariables = (sample: Draft['samples'][number]) => (sample.variables ?? []).filter(variable => preparationVariableName.test(variable.name));
+const excludedFields = new Set(['aliases', 'nominal_composition', 'measured_composition', 'purity', 'expandable_fields', 'missing_or_uncertain']);
+// Unfamiliar names may describe real preparation inputs. Exclude only explicit characterization fields.
+const characterizationVariableName = /^(?:lattice_(?:constant|parameter)(?:_[abc])?|unit_cell_volume|crystallite_size|bet_surface_area|band_gap|measured_(?:composition|oxygen_deficiency))$/i;
+export const preparationVariables = (sample: Draft['samples'][number]) => (sample.variables ?? []).filter(variable => !characterizationVariableName.test(variable.name));
 function compactSchema(schema: TSchema, legacyDerived = false): TSchema {
   const result = structuredClone(schema) as TSchema & { properties?: Record<string, TSchema>; required?: string[]; items?: TSchema };
   if (result.properties) {
@@ -203,11 +203,9 @@ export function applyFocusedRepair(response: string, draft: Draft): Draft {
     if (Array.isArray(changes.variables) && changes.variables.length) {
       changes.variables = mergeByName(sample.variables as { name: string }[], changes.variables as { name: string }[]);
     }
-    // 先合并再裁剪：compactDraft 会移除被排除字段与空数组，但它同时会删掉必填的 notes，这里补回。
+    // Expand compact patch facts without passing the untouched baseline through a lossy reader view.
     const merged = { ...structuredClone(sample), ...changes } as unknown as Draft['samples'][number];
-    const compacted = compactDraft({ assessment: draft.assessment, notes: [], samples: [merged] } as unknown as Draft) as { samples?: Draft['samples'] };
-    const carrier = { assessment: draft.assessment, notes: [], samples: compacted.samples ?? [] };
-    const parsed = parseDraft(JSON.stringify(carrier)).samples[0];
+    const parsed = expandDraft({ assessment: draft.assessment, notes: [], samples: [merged] }).samples[0];
     for (const key of Object.keys(changes) as (keyof typeof entry.changes)[]) Object.assign(sample, { [key]: parsed[key] });
   }
   if (patch.add_samples?.length) {
@@ -221,15 +219,15 @@ export function applyFocusedRepair(response: string, draft: Draft): Draft {
 }
 
 export function compactDraft(draft: Draft): unknown {
-  const trim = (entry: unknown): unknown => {
-    if (Array.isArray(entry)) return entry.map(trim).filter(item => item !== undefined);
+  const trim = (entry: unknown, explicitUnknown = false): unknown => {
+    if (Array.isArray(entry)) return entry.map(item => trim(item)).filter(item => item !== undefined);
     if (!entry || typeof entry !== 'object') return entry;
     const object = entry as Record<string, unknown>;
-    if (object.status === 'not_reported' || (object.fact as Fact | undefined)?.status === 'not_reported') return undefined;
+    if (object.status === 'not_reported' && !explicitUnknown && !object.note && object.raw === null && object.value === null && !(object.evidence as unknown[])?.length) return undefined;
     return Object.fromEntries(Object.entries(object).flatMap(([key, child]) => {
       if (excludedFields.has(key)) return [];
       if ('raw' in object && ((key === 'value' && child === object.raw) || (key === 'status' && child === 'reported') || (key === 'unit' && child === null) || (key === 'note' && child === ''))) return [];
-      const value = trim(child);
+      const value = trim(child, key === 'fact' && typeof object.name === 'string');
       if (value === undefined || (omittedFields.has(key) && (value === null || (Array.isArray(value) && !value.length)))) return [];
       return [[key, value]];
     }));
@@ -290,7 +288,10 @@ export function parseDraft(response: string): Draft {
     }
   }
   if (Check(DraftSchema, full)) return full as Draft;
-  const value = parseOutput(JSON.stringify(full), LegacyCompactDraftSchema) as Draft;
+  return expandDraft(parseOutput(JSON.stringify(full), LegacyCompactDraftSchema));
+}
+
+function expandDraft(value: unknown): Draft {
   const expandFacts = (entry: unknown): unknown => {
     if (Array.isArray(entry)) return entry.map(expandFacts);
     if (!entry || typeof entry !== 'object') return entry;

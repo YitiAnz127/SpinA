@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdir, mkdtemp, readFile, readdir, writeFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, writeFile, rm, copyFile } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readSources } from '../src/distillation/documents.ts';
@@ -89,4 +89,17 @@ test('local English and simplified Chinese language models recognize a bilingual
   const [source] = await readSources(root, [{ path: 'data/paper/scanned-cn.pdf' }]);
   assert.match(source.pages[0].text.replace(/\s+/g, ''), /样品加热两小时/);
   assert.match(source.pages[0].text, /500 C/);
+});
+
+test('OCR evidence from same-name PDFs stays isolated across source directories', { skip: !python }, async t => {
+  const root = await fixture(t);
+  for (const name of ['a', 'b']) await mkdir(resolve(root, 'data/paper', name));
+  await copyFile(resolve(root, 'data/paper/scanned.pdf'), resolve(root, 'data/paper/a/body.pdf'));
+  await copyFile(resolve(root, 'data/paper/scanned-si.pdf'), resolve(root, 'data/paper/b/body.pdf'));
+  const [a] = await readSources(root, [{ path: 'data/paper/a/body.pdf' }]);
+  const path = a.pages[0].image_path, original = await readFile(resolve(root, path));
+  const [b] = await readSources(root, [{ path: 'data/paper/b/body.pdf' }], undefined, { allowSI: true });
+  assert.notEqual(path, b.pages[0].image_path);
+  assert.notDeepEqual(original, await readFile(resolve(root, b.pages[0].image_path)));
+  assert.deepEqual(await readFile(resolve(root, path)), original);
 });

@@ -5,7 +5,7 @@ import { resolve } from 'node:path';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import type { ModelCall } from './agents.ts';
 import { runDistillation, matchingEntries } from './pipeline.ts';
-import { ExperimentStore, deliveryRecord } from './store.ts';
+import { ExperimentStore, deliveryRecord, type RecordReference } from './store.ts';
 import { resolvePaper, readSources } from './documents.ts';
 import { imageContent } from './images.ts';
 import { createDeepSeekCall, deepSeekConfig, routeDistillationCalls } from './deepseek.ts';
@@ -60,13 +60,14 @@ export function registerDistillationTools(pi: ExtensionAPI): void {
     execute: async (_callId, params, signal, _onUpdate, ctx) => {
       const store = await ExperimentStore.open(ctx.cwd);
       try {
+        const expectedState = store.getPaperState(params.paper_id);
         const preferred = store.getPaper(params.paper_id), record = store.getUncertainPaper(params.paper_id) ?? preferred;
         if (!record || record.verification.source_identity !== 'confirmed' || !/^(openai-codex|openai-compat)\/gpt-6\.1-sol:/.test(record.verified_by)) throw new Error('没有来源已确认的GPT-6.1-Sol核验记录');
         signal?.throwIfAborted();
         record.match_entries = matchingEntries(record.draft, record.verification);
-        if (record.verification_status === 'uncertain') record.candidate_match_entries = matchingEntries(record.draft, record.verification, true)
+        record.candidate_match_entries = matchingEntries(record.draft, record.verification, true)
           .filter(entry => !record.match_entries.some(match => match.sample_local_id === entry.sample_local_id && match.phase_local_id === entry.phase_local_id));
-        store.publish(record, preferred!.revision);
+        store.publish(record, expectedState);
         const run = store.createRun(params.paper_id); run.stage = 'sync_matches'; run.status = record.verification_status === 'uncertain' ? 'published_uncertain' : 'published';
         run.message = `已同步${record.match_entries.length}条经核验的金属集合匹配；科学草稿未改，未调用DS`;
         await store.saveArtifact(run, 'index_refresh.json', { scientific_changes: 0, deepseek_calls: 0, source_verified_at: record.verified_at, verified_by: record.verified_by });
@@ -233,17 +234,32 @@ export function registerDistillationTools(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: 'get_distillation_result', label: '读取蒸馏结果',
-    description: '读取已入库实验，包括带疑惑标记的记录，或按run_id读取状态。默认优先确认版本，无确认版本时返回疑惑版本；version=uncertain可指定读取疑惑版本。疑惑记录不能宣称已完全核验通过。',
-    parameters: Type.Object({ paper_id: Type.Optional(id), run_id: Type.Optional(Type.String({ pattern: '^[a-f0-9-]{36}$' })), version: Type.Optional(Type.Union([Type.Literal('preferred'), Type.Literal('uncertain')])) }, { additionalProperties: false }),
+    description: '读取已入库实验或按run_id读取状态。展开搜索命中时原样传入record_ref全部字段，版本更新后重新检索。missing_information/source_limitations是论文限制，issues是抽取问题，notes/review_notes是说明和历史记录；历史uncertain状态本身不等于发现错误，也不代表已重新核验。',
+    parameters: Type.Object({
+      paper_id: Type.Optional(id), run_id: Type.Optional(Type.String({ pattern: '^[a-f0-9-]{36}$' })),
+      version: Type.Optional(Type.Union([Type.Literal('preferred'), Type.Literal('verified'), Type.Literal('uncertain')])),
+      revision: Type.Optional(Type.Integer({ minimum: 1 })), verified_at: Type.Optional(Type.String({ minLength: 1 })),
+    }, { additionalProperties: false }),
     annotations: { readOnlyHint: true, openWorldHint: false },
     execute: async (_callId, params, _signal, _onUpdate, ctx) => {
       if ((!params.paper_id && !params.run_id) || (params.paper_id && params.run_id)) throw new Error('请指定 paper_id 或 run_id 中的一项');
+      if (params.run_id && (params.version !== undefined || params.revision !== undefined || params.verified_at !== undefined)) throw new Error('run_id 不能与论文版本参数一起使用');
+      const pinned = params.revision !== undefined || params.verified_at !== undefined;
+      if (pinned && (params.revision === undefined || !params.verified_at || !params.version || params.version === 'preferred')) throw new Error('锁定记录需要同时提供明确的version、revision和verified_at，请复制搜索结果的record_ref');
       const store = await ExperimentStore.openExisting(ctx.cwd);
-      if (!store) return response(null);
+      if (!store) {
+        if (pinned) throw new Error('检索版本不可用，请重新检索后展开');
+        return response(null);
+      }
       try {
         if (params.run_id) return response(store.getRun(params.run_id));
-        const record = params.version === 'uncertain' ? store.getUncertainPaper(params.paper_id!) : store.getPaper(params.paper_id!);
-        return response(record ? deliveryRecord(record) : null);
+        const record = pinned
+          ? store.getReferencedPaper({ paper_id: params.paper_id!, version: params.version as RecordReference['version'], revision: params.revision!, verified_at: params.verified_at! })
+          : store.getPaper(params.paper_id!, params.version);
+        return response(record ? { ...deliveryRecord(record), record_ref: {
+          paper_id: record.paper.paper_id, version: record.verification_status ?? 'verified',
+          revision: record.revision, verified_at: record.verified_at,
+        } } : null);
       }
       finally { store.close(); }
     },
@@ -251,13 +267,24 @@ export function registerDistillationTools(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: 'search_spinel_experiments', label: '检索尖晶石制备实验',
-    description: '按目标相金属元素集合恰好匹配已入库实验。默认包含疑惑记录，返回certainty和possible标记及问题；possible=true只表示可能匹配，不能当成确定匹配。',
-    parameters: Type.Object({ metal_elements: Type.Array(Type.String({ pattern: '^[A-Z][a-z]?$' }), { minItems: 1, maxItems: 12 }), include_uncertain: Type.Optional(Type.Boolean()), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })) }, { additionalProperties: false }),
+    description: '按目标相金属集合检索，返回results、total、next_offset和has_more。默认exact，related提示含额外金属的体系，superset可分页查看补充案例。method_summary列大纲，record_ref绑定版本。missing_information/source_limitations在回答中体现，只有issues标抽取问题；certainty是存储版本，不直接作为疑惑判断。possible=true始终只表示可能匹配。total按版本/样品/相计数。',
+    parameters: Type.Object({
+      metal_elements: Type.Array(Type.String({ pattern: '^[A-Z][a-z]?$' }), { minItems: 1, maxItems: 12 }),
+      include_uncertain: Type.Optional(Type.Boolean()), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+      offset: Type.Optional(Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER })),
+      match: Type.Optional(Type.Union([Type.Literal('exact'), Type.Literal('superset')])),
+    }, { additionalProperties: false }),
     annotations: { readOnlyHint: true, openWorldHint: false },
     execute: async (_callId, params, _signal, _onUpdate, ctx) => {
       const store = await ExperimentStore.openExisting(ctx.cwd);
-      if (!store) return response([]);
-      try { return response(store.searchByElements(params.metal_elements, params.include_uncertain ?? true, params.limit ?? 20)); }
+      if (!store) return response({
+        metal_elements: [...new Set(params.metal_elements)].sort(), match: params.match ?? 'exact',
+        total: 0, offset: params.offset ?? 0, limit: params.limit ?? 20, has_more: false, next_offset: null, results: [],
+        related: { total: 0, uncertain: 0, possible: 0, metal_sets: [] },
+      });
+      try { return response(store.searchByElements(params.metal_elements, {
+        includeUncertain: params.include_uncertain, limit: params.limit, offset: params.offset, match: params.match,
+      })); }
       finally { store.close(); }
     },
   });
