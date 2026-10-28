@@ -130,3 +130,38 @@ test('a publication conflict after the final repair fails cleanly without overwr
     assert.equal(store.getPaper(paper.paper_id).revision, 1);
   } finally { store.close(); }
 });
+
+for (const [kind, error] of [
+  ['timeout', new DOMException('The operation was aborted due to timeout', 'TimeoutError')],
+  ['quota', Object.assign(new Error('DeepSeek HTTP 429'), { status: 429 })],
+]) test(`check-only verification preserves a ${kind} failure for batch retry`, async t => {
+  const root = await workspace(t);
+  const result = await runDistillation(root, { ...paper, sources: [{ path: 'data/paper/body.pdf' }] }, async request => {
+    if (request.stage === 'verify') throw error;
+    return JSON.stringify(draft());
+  }, { maxRepairs: 0, readSources: async () => sources });
+  assert.equal(result.status, 'failed');
+  assert.equal(result.error_kind, kind);
+  const store = await ExperimentStore.openExisting(root);
+  try {
+    assert.equal(store.getRun(result.run_id).error_kind, kind);
+    assert.equal(store.getPaper(paper.paper_id), null);
+  } finally { store.close(); }
+});
+
+test('user cancellation is persisted separately from a timeout', async t => {
+  const root = await workspace(t), controller = new AbortController();
+  const result = await runDistillation(root, { ...paper, sources: [{ path: 'data/paper/body.pdf' }] }, async () => {
+    controller.abort(); controller.signal.throwIfAborted();
+  }, { signal: controller.signal, readSources: async () => sources });
+  assert.equal(result.status, 'cancelled');
+  assert.equal(result.error_kind, 'cancelled');
+});
+
+test('malformed first extraction output retains a non-retryable structure category', async t => {
+  const root = await workspace(t);
+  const result = await runDistillation(root, { ...paper, sources: [{ path: 'data/paper/body.pdf' }] },
+    async () => '{invalid JSON', { maxRepairs: 0, readSources: async () => sources });
+  assert.equal(result.status, 'failed');
+  assert.equal(result.error_kind, 'structure');
+});

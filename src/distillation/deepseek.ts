@@ -1,5 +1,6 @@
 import type { AgentRequest, ModelCall } from './agents.ts';
 import { imageContent } from './images.ts';
+import { classifyError, SpinaError } from '../errors.ts';
 import { readStoredCredential } from '../../node_modules/@earendil-works/pi-coding-agent/dist/core/auth-storage.js';
 
 export interface DeepSeekConfig {
@@ -63,7 +64,7 @@ export function createDeepSeekCall(root: string, config: DeepSeekConfig, options
     });
     if (!response.ok) {
       const hint = response.status === 401 ? '认证失败，请检查 DEEPSEEK_API_KEY' : response.status === 402 ? '余额不足，请检查 DeepSeek 账户' : response.status === 429 ? 'rate_limit，稍后重试' : response.status >= 500 ? 'upstream network failure' : '请求被拒绝，请检查参数';
-      throw new Error(`DeepSeek HTTP ${response.status}：${hint}`);
+      throw new SpinaError(classifyError({ status: response.status }), `DeepSeek HTTP ${response.status}：${hint}`);
     }
     const result = await response.json() as { model?: string; usage?: unknown; choices?: { finish_reason?: string; message?: { content?: string } }[] };
     const choice = result.choices?.[0];

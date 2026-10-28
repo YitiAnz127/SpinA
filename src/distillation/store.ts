@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import type { PaperIdentity, Draft, Verification, SourceDocument, Fact } from './schema.ts';
 import { deriveMetalElements, preparationVariables } from './schema.ts';
 import { isExtractionIssue, isSourceLimitationIssue, issueText, missingInformation, sourceLimitations, sourceInformationMessages, type MissingInformation } from './missing-information.ts';
+import type { ErrorKind } from '../errors.ts';
 
 export interface PublishedRecord {
   schema_version: 1;
@@ -31,6 +32,7 @@ export interface RunState {
   started_at: string;
   updated_at: string;
   message: string;
+  error_kind?: ErrorKind;
 }
 
 export interface RecordReference {
@@ -334,19 +336,24 @@ export class ExperimentStore {
     await rename(temporary, destination);
   }
 
-  publish(record: PublishedRecord, expected: PaperState): void {
+  publish(record: PublishedRecord, expected: PaperState, completedRun?: RunState): void {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const current = this.getPaperState(record.paper.paper_id);
       if (expected?.paper_id !== current.paper_id || current.verified !== expected.verified || current.uncertain !== expected.uncertain) throw new Error('该论文已被另一个任务更新，请重新蒸馏当前版本');
+      if (completedRun) {
+        const active = this.getRun(completedRun.run_id);
+        const expectedStatus = record.verification_status === 'uncertain' ? 'published_uncertain' : 'published';
+        if (!active || active.status !== 'running' || active.paper_id !== record.paper.paper_id || completedRun.paper_id !== record.paper.paper_id || completedRun.status !== expectedStatus) throw new Error('发布任务与论文或终态不一致');
+      }
       if (record.verification_status === 'uncertain') {
         this.db.prepare('INSERT INTO uncertain_papers (paper_id, record_json) VALUES (?, ?) ON CONFLICT(paper_id) DO UPDATE SET record_json=excluded.record_json').run(record.paper.paper_id, JSON.stringify(record));
-        this.db.exec('COMMIT');
-        return;
+      } else {
+        this.db.prepare('INSERT INTO papers (paper_id, doi, title, revision, verified_at, record_json) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(paper_id) DO UPDATE SET doi=excluded.doi, title=excluded.title, revision=excluded.revision, verified_at=excluded.verified_at, record_json=excluded.record_json')
+          .run(record.paper.paper_id, record.paper.doi, record.paper.title, record.revision, record.verified_at, JSON.stringify(record));
+        this.db.prepare('DELETE FROM uncertain_papers WHERE paper_id = ?').run(record.paper.paper_id);
       }
-      this.db.prepare('INSERT INTO papers (paper_id, doi, title, revision, verified_at, record_json) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(paper_id) DO UPDATE SET doi=excluded.doi, title=excluded.title, revision=excluded.revision, verified_at=excluded.verified_at, record_json=excluded.record_json')
-        .run(record.paper.paper_id, record.paper.doi, record.paper.title, record.revision, record.verified_at, JSON.stringify(record));
-      this.db.prepare('DELETE FROM uncertain_papers WHERE paper_id = ?').run(record.paper.paper_id);
+      if (completedRun) this.saveRun(completedRun);
       this.db.exec('COMMIT');
     } catch (error) {
       this.db.exec('ROLLBACK');

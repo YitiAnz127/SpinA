@@ -7,12 +7,12 @@ import { runDistillation } from './distillation/pipeline.ts';
 import { resolvePaper } from './distillation/documents.ts';
 import { imageContent } from './distillation/images.ts';
 import { ExperimentStore } from './distillation/store.ts';
-import { applyFocusedRepair, parseDraft, parseVerification } from './distillation/schema.ts';
 import { createDeepSeekCall, deepSeekConfig } from './distillation/deepseek.ts';
 import { SOL_POLICY, SOL_LABEL } from './model-policy.ts';
 import { quotaRetryDelay } from './batch-retry.mjs';
-import { batchModelKey, checkedExtraction, sameSourceVersions } from './batch-cache.ts';
+import { batchModelKey, checkedExtraction, sameSourceVersions, validateBatchOutput } from './batch-cache.ts';
 import { sourceVersion } from './distillation/source-version.ts';
+import { classifyError } from './errors.ts';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const checkOnly = process.argv.includes('--check-only');
@@ -139,7 +139,7 @@ const processItem = async item => {
       if (checkOnly && request.stage === 'repair') throw Error('只检查模式不执行修正');
       const modelKey = batchModelKey(request.stage, verifierLabel, distillConfig);
       const cached = cache.requests.find(c => c.model_key === modelKey && c.stage === request.stage && c.system === request.system && c.input === request.input);
-      if (cached) { emit({ paper_id: item.paper_id, stage: request.stage, event: 'reuse_verified_output' }); return cached.output; }
+      if (cached) { validateBatchOutput(request, cached.output); emit({ paper_id: item.paper_id, stage: request.stage, event: 'reuse_verified_output' }); return cached.output; }
       const started = Date.now(); emit({ paper_id: item.paper_id, stage: request.stage, event: 'request_start', model_key: modelKey, images: request.images?.length ?? 0 });
       let output, metadata;
       try {
@@ -156,29 +156,30 @@ const processItem = async item => {
           metadata = { model: result.model, provider: result.provider, reasoning: SOL_POLICY.reasoning, usage: result.usage, stop_reason: result.stopReason };
         }
       }
-      catch (error) { resourceError = error.message; throw error; }
+      catch (error) { resourceError = error; throw error; }
       metadata = { ...metadata, seconds: (Date.now() - started) / 1000 };
       await save(`${item.paper_id}-${request.stage}-last.json`, { source_versions: versions, metadata, output }); emit({ paper_id: item.paper_id, stage: request.stage, event: 'request_end', ...metadata });
-      if (request.stage === 'verify') parseVerification(output);
-      else if (request.outputShape === 'patch') applyFocusedRepair(output, JSON.parse(request.input).draft);
-      else parseDraft(output);
+      validateBatchOutput(request, output);
       cache.requests.push({ model_key: modelKey, stage: request.stage, system: request.system, input: request.input, output, metadata }); await save(item.paper_id+'-calls.json',cache);
       return output;
     };
-    const run = await runDistillation(root, { paper_id: item.paper_id }, call, { maxRepairs: (checkOnly || distillOnly) ? 0 : 3, focusedRepairs: false, modelLabel: verifierLabel, distillationModelLabel: reuseDraft ? `deepseek/${savedExtraction.metadata.model}:${savedExtraction.metadata.reasoning}` : `deepseek/${distillConfig.model}:${distillConfig.effort}`, onProgress: run => { control.active_papers[item.paper_id] = run.stage; control.current_paper = item.paper_id; control.current_stage = run.stage; control.run_id = run.run_id; void snapshot(); } });
+    const run = await runDistillation(root, { paper_id: item.paper_id }, call, { maxRepairs: (checkOnly || distillOnly) ? 0 : 3, focusedRepairs: true, modelLabel: verifierLabel, distillationModelLabel: reuseDraft ? `deepseek/${savedExtraction.metadata.model}:${savedExtraction.metadata.reasoning}` : `deepseek/${distillConfig.model}:${distillConfig.effort}`, onProgress: run => { control.active_papers[item.paper_id] = run.stage; control.current_paper = item.paper_id; control.current_stage = run.stage; control.run_id = run.run_id; void snapshot(); } });
     if (reuseDraft) {
       const provenanceStore = await ExperimentStore.open(root);
       try { await provenanceStore.saveArtifact(run, 'check-input.json', { mode: checkOnly ? 'check_existing_draft' : 'repair_existing_draft', original_output: `data/distillation/batch/${item.paper_id}-distill-last.json`, model: savedExtraction.metadata.model, reasoning: savedExtraction.metadata.reasoning, source_versions: versions, new_distillation_calls: 0 }); }
       finally { provenanceStore.close(); }
     }
     item.run_id = run.run_id; item.message = run.message;
-    if (run.status === 'failed' && /usage limit|usage\.limit|quota|rate limit|rate_limit|requests per|HTTP\s*429|status\s*429|too many requests|limit.*reached/i.test(resourceError ?? run.message)) {
+    const errorKind = run.error_kind ?? classifyError(resourceError ?? run.message);
+    if (run.status === 'failed' || run.status === 'cancelled') item.error_kind = errorKind;
+    else delete item.error_kind;
+    if (run.status === 'failed' && errorKind === 'quota') {
       item.status = 'waiting_for_quota'; item.message = run.message; emit({ event: 'quota_wait', paper_id: item.paper_id, message: run.message });
       // No paid fallback or reset-credit use. Keep successful earlier stages and retry after the quota window.
       if (!await waitForItem(item, quotaRetryDelay(run.message))) return;
       item.status = 'running'; continue;
     }
-    if (run.status === 'failed' && /fetch failed|network error|socket hang|ECONNRESET|ECONNREFUSED|ETIMEDOUT|gateway timeout|upstream timeout|HTTP\s*5\d\d|status\s*5\d\d/i.test(resourceError ?? run.message)) {
+    if (run.status === 'failed' && (errorKind === 'network' || errorKind === 'timeout')) {
       // 真正的传输层故障才重试，且最多 2 次：模型输出不合规（JSON 错位、结构不符）必须立即失败，不能反复烧额度。
       transientFailures++;
       if (transientFailures > 2) { item.status = 'failed'; item.message = `${run.message}（网络重试 ${transientFailures - 1} 次后放弃）`; item.finished_at = new Date().toISOString(); await snapshot(); emit({ event: 'paper_finished', ...item }); break; }
@@ -186,11 +187,11 @@ const processItem = async item => {
       if (!await waitForItem(item, Math.min(15, transientFailures) * 60000)) return;
       item.status = 'running'; continue;
     }
-    if(run.status==='failed'&&/只有 SI|尚缺正文|没有可读文本层|不是 PDF/.test(run.message))run.status='source_unavailable';
-    item.status = run.status; item.finished_at = new Date().toISOString(); await snapshot(); emit({ event: 'paper_finished', ...item }); break;
+    item.status = run.status === 'failed' && errorKind === 'source' ? 'source_unavailable' : run.status;
+    item.finished_at = new Date().toISOString(); await snapshot(); emit({ event: 'paper_finished', ...item }); break;
     }
   } catch (error) {
-    item.status = 'failed'; item.message = error.message; item.finished_at = new Date().toISOString();
+    item.status = 'failed'; item.message = error.message; item.error_kind = classifyError(error); item.finished_at = new Date().toISOString();
     await snapshot(); emit({ event: 'paper_finished', ...item });
   } finally {
     delete control.active_papers[item.paper_id];

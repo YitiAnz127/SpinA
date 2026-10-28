@@ -1,5 +1,8 @@
 import type { DeepSeekConfig } from './distillation/deepseek.ts';
 import type { SourceVersion } from './distillation/source-version.ts';
+import type { AgentRequest } from './distillation/agents.ts';
+import { applyFocusedRepair, parseDraft, parseVerification } from './distillation/schema.ts';
+import { SpinaError } from './errors.ts';
 
 interface SavedExtraction {
   metadata: { provider: string; stop_reason: string; model: string; reasoning: string };
@@ -29,4 +32,14 @@ export function checkedExtraction(saved: SavedExtraction | null, cache: CallCach
 
 export function batchModelKey(stage: string, verifierLabel: string, config: DeepSeekConfig): string {
   return stage === 'verify' ? verifierLabel : `deepseek/${config.model}:${stage === 'repair' ? config.repairEffort : config.effort}`;
+}
+
+export function validateBatchOutput(request: Pick<AgentRequest, 'stage' | 'input' | 'outputShape'>, output: string): void {
+  try {
+    if (request.stage === 'verify') parseVerification(output);
+    else if (request.outputShape === 'patch') applyFocusedRepair(output, parseDraft(JSON.stringify(JSON.parse(request.input).draft)));
+    else parseDraft(output);
+  } catch (error) {
+    throw new SpinaError('structure', (error as Error).message, { cause: error });
+  }
 }

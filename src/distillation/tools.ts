@@ -11,6 +11,7 @@ import { imageContent } from './images.ts';
 import { createDeepSeekCall, deepSeekConfig, routeDistillationCalls } from './deepseek.ts';
 import { SOL_POLICY, SOL_LABEL } from '../model-policy.ts';
 import { applyFocusedRepair, parseModelJson } from './schema.ts';
+import { classifyError } from '../errors.ts';
 
 const id = Type.String({ pattern: '^[A-Za-z0-9_-]{1,80}$' });
 const SourceInputSchema = Type.Object({
@@ -67,11 +68,18 @@ export function registerDistillationTools(pi: ExtensionAPI): void {
         record.match_entries = matchingEntries(record.draft, record.verification);
         record.candidate_match_entries = matchingEntries(record.draft, record.verification, true)
           .filter(entry => !record.match_entries.some(match => match.sample_local_id === entry.sample_local_id && match.phase_local_id === entry.phase_local_id));
-        store.publish(record, expectedState);
         const run = store.createRun(params.paper_id); run.stage = 'sync_matches'; run.status = record.verification_status === 'uncertain' ? 'published_uncertain' : 'published';
         run.message = `已同步${record.match_entries.length}条经核验的金属集合匹配；科学草稿未改，未调用DS`;
-        await store.saveArtifact(run, 'index_refresh.json', { scientific_changes: 0, deepseek_calls: 0, source_verified_at: record.verified_at, verified_by: record.verified_by });
-        await store.saveArtifact(run, 'record.json', deliveryRecord(record)); store.saveRun(run);
+        try {
+          await store.saveArtifact(run, 'index_refresh.json', { scientific_changes: 0, deepseek_calls: 0, source_verified_at: record.verified_at, verified_by: record.verified_by });
+          await store.saveArtifact(run, 'record.json', deliveryRecord(record));
+          signal?.throwIfAborted();
+          store.publish(record, expectedState, run);
+        } catch (error) {
+          run.status = signal?.aborted ? 'cancelled' : 'failed'; run.message = (error as Error).message;
+          run.error_kind = signal?.aborted ? 'cancelled' : classifyError(error); store.saveRun(run);
+          throw error;
+        }
         return response(run);
       } finally { store.close(); }
     },

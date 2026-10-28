@@ -4,6 +4,7 @@ import { ExperimentStore, sourceManifest, deliveryRecord, type PublishedRecord, 
 import { derivePhaseMetalElements, draftReviewNotes, validateDraft, validateEvidence } from './schema.ts';
 import type { Draft, DraftReviewNote, SourceDocument, Verification } from './schema.ts';
 import { isSourceLimitationIssue } from './missing-information.ts';
+import { classifyError, type ErrorKind } from '../errors.ts';
 
 export interface PipelineOptions {
   signal?: AbortSignal;
@@ -118,9 +119,11 @@ export async function runDistillation(root: string, input: DistillInput, modelCa
     store.saveRun(run);
     options.onProgress?.({ ...run });
   };
-  const finish = (status: RunState['status'], message: string) => {
+  const finish = (status: RunState['status'], message: string, errorKind?: ErrorKind) => {
     run.status = status;
     run.message = message;
+    if (errorKind) run.error_kind = errorKind;
+    else delete run.error_kind;
     store.saveRun(run);
     return { ...run };
   };
@@ -189,8 +192,11 @@ export async function runDistillation(root: string, input: DistillInput, modelCa
       await store.saveArtifact(run, 'selection.json', { repair_attempts: repairAttempts, selected_round: candidate.round, score: candidate.score, status: record.verification_status });
       await store.saveArtifact(run, 'record.json', deliveryRecord(record));
       options.signal?.throwIfAborted();
-      store.publish(record, expectedState);
-      return finish(uncertain ? 'published_uncertain' : 'published', uncertain ? `已入库 ${candidate.draft.samples.length} 条样品记录，标记疑惑，可检索；修正 ${repairAttempts} 次` : `已发布 ${candidate.draft.samples.length} 条样品记录、${matches.length} 条目标相匹配项；修正 ${repairAttempts} 次`);
+      const completed: RunState = { ...run, status: uncertain ? 'published_uncertain' : 'published',
+        message: uncertain ? `已入库 ${candidate.draft.samples.length} 条样品记录，标记疑惑，可检索；修正 ${repairAttempts} 次` : `已发布 ${candidate.draft.samples.length} 条样品记录、${matches.length} 条目标相匹配项；修正 ${repairAttempts} 次` };
+      store.publish(record, expectedState, completed);
+      Object.assign(run, completed);
+      return { ...run };
     };
     fallback = async reason => best ? publish(best, true, reason) : finish('needs_review', '修正已达上限，但没有来源已确认且结构可用的版本，未入库');
     let previousReview: Verification | undefined;
@@ -258,10 +264,10 @@ export async function runDistillation(root: string, input: DistillInput, modelCa
   } catch (error) {
     const cancelled = !!options.signal?.aborted;
     if (lastResponse && !cancelled) await store.saveArtifact(run, 'last_model_output.json', lastResponse);
-    if (!cancelled && !publicationStarted && repairAttempts === maxRepairs && fallback) {
+    if (!cancelled && !publicationStarted && repairAttempts > 0 && repairAttempts === maxRepairs && fallback) {
       try { return await fallback(`修正后的处理未完成：${(error as Error).message}`); }
-      catch (publishError) { return finish('failed', (publishError as Error).message); }
+      catch (publishError) { return finish('failed', (publishError as Error).message, classifyError(publishError)); }
     }
-    return finish(cancelled ? 'cancelled' : 'failed', cancelled ? '任务已取消，未覆盖已有记录' : (error as Error).message);
+    return finish(cancelled ? 'cancelled' : 'failed', cancelled ? '任务已取消，未覆盖已有记录' : (error as Error).message, cancelled ? 'cancelled' : classifyError(error));
   } finally { store.close(); }
 }

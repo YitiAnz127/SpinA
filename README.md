@@ -124,7 +124,9 @@ npm run batch -- --only SPINA-0006 --repair-existing
 ```
 
 - 默认并发 2 篇，`SPINA_BATCH_CONCURRENCY` 可设 1–4。
+- 批处理与交互工具均使用定点补丁修正，保留未改字段；最多修正 3 次，最后一次按保守收敛规则处理。新回复和缓存回复均先做结构校验。
 - 来源缺失的论文单列，已有发布记录默认跳过。
+- 任务失败时用 `error_kind` 区分超时、取消、配额、网络、结构及来源问题。网络与超时最多重试 2 次；用户取消、结构错误不会触发自动重试，配额耗尽沿用等待恢复机制。默认 20 分钟请求超时不变。
 - 在 `data/distillation/batch/control.json` 写入 `{"stop": true}` 可在当前论文完成或等待期间停止；继续前清除该标记，再执行同一命令。
 - 不要同时启动多个批处理进程。
 
@@ -171,13 +173,15 @@ Copy-Item data\demo\spina.sqlite data\distillation\spina.sqlite
 
 返回分页对象：`results` 是当前页，`total` 为符合条件的版本／样品／相条目数，`has_more` 与 `next_offset` 表示后续页。默认 `limit=20`、`offset=0`，每页最多 100 条。确认与疑惑并存的版本分别计数，不等于独立论文数或独立配方数。
 
-每条结果携带 `record_ref={paper_id, version, revision, verified_at}`；展开时原样传给 `get_distillation_result`，再按 `sample_id`、`phase_id` 定位。版本被替换或移除时要求重新检索，不自动回退。发布时在同一事务内核对开始读取的确认版与疑惑版快照，任一被其他任务更新则拒绝覆盖并结束为失败。
+每条结果携带 `record_ref={paper_id, version, revision, verified_at}`；展开时原样传给 `get_distillation_result`，再按 `sample_id`、`phase_id` 定位。版本被替换或移除时要求重新检索，不自动回退。发布时在同一事务内核对开始读取的确认版与疑惑版快照，任一被其他任务更新则拒绝覆盖并结束为失败。任务产物先写入文件；论文记录与任务的发布终态随后在同一个 SQLite 事务内提交，终态保存失败会回滚论文更新及旧疑惑版清除。
 
 三种“问题”不混用：
 
 - `missing_information`：原文未报告个别条件或外部方法未取得。主要制备信息完整时不阻止确认入库。
 - `source_limitations`：原文自身含糊、数值冲突或产物未明确确认。不是抽取错误。
 - `issues`：记录偏离原文的具体抽取问题（已确认错误或明确要求修正）。已确认错误不能靠 `source_limit` 标签变成论文限制。
+
+已确认且影响匹配的错误按样品／目标相范围排除，不能继续进入 `possible` 候选；真实来源限制仍可保留为可能匹配。
 
 疑惑版本（`published_uncertain` / `status=uncertain`）存入历史待核对表，不覆盖既有确认版本；它本身不等于存在抽取错误。确认入库也不等于科学正确性。
 

@@ -13,6 +13,7 @@ export interface AgentRequest {
   outputShape?: 'draft' | 'patch';
 }
 export type ModelCall = (request: AgentRequest) => Promise<string>;
+const finalRepairInstruction = '这是最后一次修正。优先保守收敛：删除无原文明示依据的推算，不确定的条件改为ambiguous/source_missing/not_reported并说明；保留真实样品及已确认的组成和制备信息。不能靠虚构数值或隐藏问题宣称通过。输出应比原草稿更忠实于来源，足以供带疑惑标记的检索使用。';
 
 // 核验只需要核读草稿实际引用到的页：正文/SI 全文仍在文本层里，页图只用于核实被引用处的排版、上下标与 OCR 差异。
 // 全量页图会让每篇核验的输入膨胀到 6 万 token 以上（页图约占七成），而绝大多数页与被核验的事实无关。
@@ -108,7 +109,7 @@ export class DistillationAgent {
   async repair(paper: PaperIdentity, sources: SourceDocument[], draft: Draft, feedback: unknown, signal?: AbortSignal): Promise<Draft> {
     const context = feedback as { repair_round?: number; repair_limit?: number; final_round?: boolean };
     const instruction = context.final_round
-      ? '这是最后一次修正。优先保守收敛：删除无原文明示依据的推算，不确定的条件改为ambiguous/source_missing/not_reported并说明；保留真实样品及已确认的组成和制备信息。不能靠虚构数值或隐藏问题宣称通过。输出应比原草稿更忠实于来源，足以供带疑惑标记的检索使用。'
+      ? finalRepairInstruction
       : '仅按具体反馈修正，保留已确认正确的信息。核验建议也必须对照原文，不能直接当成新实验事实。无法确认的内容明确标为未知，不反复扩展无关内容。';
     return parseDraft(await this.call({
       stage: 'repair', system: await systemPrompt('distill', CompactDraftSchema, `第${context.repair_round ?? 1}/${context.repair_limit ?? 3}次修正`) + '\n' + instruction,
@@ -117,9 +118,10 @@ export class DistillationAgent {
   }
 
   async repairFocused(paper: PaperIdentity, sources: SourceDocument[], draft: Draft, feedback: unknown, signal?: AbortSignal): Promise<Draft> {
-    const context = feedback as { repair_round: number; repair_limit: number };
+    const context = feedback as { repair_round: number; repair_limit: number; final_round?: boolean };
     return applyFocusedRepair(await this.call({
       stage: 'repair', outputShape: 'patch', system: await systemPrompt('repair', focusedRepairSchema(draft), `定点修正第${context.repair_round}/${context.repair_limit}次`) +
+        (context.final_round ? '\n' + finalRepairInstruction : '') +
         '\n只返回patches：sample_local_id必须逐字复制input.sample_ids里的值（不能简写为s1或自造名称，写错会被程序拒收）；每项指定现有sample_local_id和changes中确需修正的字段，不能重写整篇或返回完整draft。修改数组字段时只给出需要改动的条目（steps/materials/phases按local_id、variables按name定位），未列出的条目由程序原样保留；其他样品和字段同样由程序保留。空steps默认不删除已有步骤，只有确须删除全部步骤时才显式clear_steps=true；拆分分支时必须保留父模板中已核验的共同前处理并由子分支继承。只有核验指出缺少真实制备分支时才使用add_samples，不能新增性能对照。source_limit不靠猜测消除；仅当其限定漏传时补说明。必须修正已确认遗漏、错配和继承错误，不能只增加一条“仍有疑惑”的备注来代替修正。金属集合已明确时可独立确认metal_elements，不要求精确相计量。',
       input: JSON.stringify({ paper, sample_ids: draft.samples.map(sample => sample.local_id), sources: repairSources(sources, draft, feedback), draft: compactDraft(draft), feedback }), signal, images: pageImages(sources, new Set([...citedPageKeys(draft), ...issuePageKeys(feedback)])),
     }), draft);
