@@ -1,4 +1,5 @@
 /** Respect the provider's wait units instead of treating minute estimates as an unknown delay. */
+/** @param {string} message */
 export function quotaRetryDelay(message) {
   const match = /try again in\s*~?\s*(\d+(?:\.\d+)?)\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)\b/i.exec(message);
   if (!match) return 5 * 3600000;

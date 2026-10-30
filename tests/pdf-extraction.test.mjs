@@ -21,7 +21,12 @@ async function fixture(t) {
   t.after(() => rm(root, { recursive: true, force: true }));
   await mkdir(resolve(root, 'data/paper'), { recursive: true });
   await mkdir(resolve(root, '.runtime'), { recursive: true });
-  await writeFile(resolve(root, '.runtime/pdf-tools.json'), JSON.stringify({ python, ocr_lang_path: resolve(project, config.ocr_lang_path ?? '.runtime/tessdata'), ocr_languages: 'eng' }));
+  await mkdir(resolve(root, '.runtime/tessdata'), { recursive: true });
+  for (const language of ['eng', 'chi_sim']) {
+    await copyFile(resolve(project, config.ocr_lang_path ?? '.runtime/tessdata', `${language}.traineddata`), resolve(root, '.runtime/tessdata', `${language}.traineddata`))
+      .catch(error => { if (error.code !== 'ENOENT') throw error; });
+  }
+  await writeFile(resolve(root, '.runtime/pdf-tools.json'), JSON.stringify({ python, ocr_lang_path: '.runtime/tessdata', ocr_languages: 'eng' }));
   const { stdout } = await exec(python, [resolve(project, 'tests/fixtures/pdf-extraction.py'), resolve(root, 'data/paper')]);
   try { fixtureFonts.set(root, JSON.parse(stdout.trim().split('\n').pop() || '{}')); } catch { fixtureFonts.set(root, {}); }
   return root;
@@ -51,7 +56,7 @@ test('reads a fully scanned body and rejects a scanned SI passed as the body', {
 test('native page-reading tool returns paginated text and structured tables without a model request', { skip: !python }, async t => {
   const root = await fixture(t);
   const tools = new Map();
-  spina({ registerTool: tool => tools.set(tool.name, tool), registerCommand: () => {}, on: () => {} });
+  spina({ registerMarkdownTransformer: () => {}, registerTool: tool => tools.set(tool.name, tool), registerCommand: () => {}, on: () => {} });
   assert.ok(tools.has('read_paper_pages'));
   const ctx = { cwd: root, hasUI: false };
   const input = { paper_id: 'FIXTURE-PDF', doi: '10.1234/fixture', title: 'Synthetic extraction fixture', sources: [{ path: 'data/paper/mixed.pdf' }], source_id: 'src_1', first_page: 2, last_page: 2 };
@@ -70,6 +75,7 @@ test('native page-reading tool returns paginated text and structured tables with
 
 test('missing OCR language data fails clearly and releases temporary extraction files', { skip: !python }, async t => {
   const root = await fixture(t);
+  await mkdir(resolve(root, '.runtime/missing-data'), { recursive: true });
   await writeFile(resolve(root, '.runtime/pdf-tools.json'), JSON.stringify({ python, ocr_lang_path: '.runtime/missing-data', ocr_languages: 'eng' }));
   await assert.rejects(readSources(root, [{ path: 'data/paper/scanned.pdf' }]), /缺少 eng 识别模型/);
   assert.deepEqual(await readdir(resolve(root, '.runtime/pdf-extraction')), []);
@@ -88,7 +94,7 @@ test('cancelling extraction stops its subprocess and releases temporary files', 
 test('local English and simplified Chinese language models recognize a bilingual scan', { skip: !python }, async t => {
   const root = await fixture(t);
   if (fixtureFonts.get(root)?.cjk === false) { t.skip('本机缺少中文字体，跳过中英混排 OCR 用例'); return; }
-  await writeFile(resolve(root, '.runtime/pdf-tools.json'), JSON.stringify({ python, ocr_lang_path: resolve(project, config.ocr_lang_path ?? '.runtime/tessdata'), ocr_languages: 'eng+chi_sim' }));
+  await writeFile(resolve(root, '.runtime/pdf-tools.json'), JSON.stringify({ python, ocr_lang_path: '.runtime/tessdata', ocr_languages: 'eng+chi_sim' }));
   const [source] = await readSources(root, [{ path: 'data/paper/scanned-cn.pdf' }]);
   assert.match(source.pages[0].text.replace(/\s+/g, ''), /样品加热两小时/);
   assert.match(source.pages[0].text, /500 C/);

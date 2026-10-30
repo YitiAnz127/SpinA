@@ -1,8 +1,9 @@
-import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, stat } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ModelRuntime, ModelRegistry } from '@earendil-works/pi-coding-agent';
-import { AuthStorage } from '../node_modules/@earendil-works/pi-coding-agent/dist/core/auth-storage.js';
+import { saveJson } from './batch-io.mjs';
+import { readCatalog } from './distillation/catalog.ts';
 import { runDistillation } from './distillation/pipeline.ts';
 import { resolvePaper } from './distillation/documents.ts';
 import { imageContent } from './distillation/images.ts';
@@ -10,10 +11,22 @@ import { ExperimentStore } from './distillation/store.ts';
 import { createDeepSeekCall, deepSeekConfig } from './distillation/deepseek.ts';
 import { SOL_POLICY, SOL_LABEL } from './model-policy.ts';
 import { quotaRetryDelay } from './batch-retry.mjs';
-import { batchModelKey, checkedExtraction, sameSourceVersions, validateBatchOutput } from './batch-cache.ts';
+import { batchModelKey, batchRequestKey, compactCallCache, checkedExtraction, sameSourceVersions, validateBatchOutput } from './batch-cache.ts';
 import { sourceVersion } from './distillation/source-version.ts';
 import { classifyError } from './errors.ts';
 
+/** @typedef {ReturnType<typeof checkedExtraction>} SavedExtraction */
+/** @typedef {SavedExtraction['metadata'] & { usage?: unknown, seconds?: number }} CallMetadata */
+/** @typedef {{ source_versions: import('./distillation/source-version.ts').SourceVersion[], requests: {
+ * stage: string, output: string, metadata: CallMetadata, model_key?: string, request_key?: string, system?: string, input?: string
+ * }[] }} CallCache */
+/** @typedef {{ paper_id: string, status: import('./distillation/store.ts').RunState['status'] | 'pending' | 'claimed' | 'already_published' | 'source_unavailable' | 'waiting_for_quota' | 'waiting_for_network',
+ * message?: string, revision?: number, run_id?: string, finished_at?: string, resume_at?: string, error_kind?: import('./errors.ts').ErrorKind }} QueueItem */
+/** @typedef {{ status: string, mode: string, model: string, reasoning: string, distillation_model: string, distillation_reasoning: string,
+ * concurrency: number, current_paper: string | null, current_stage: string | null, active_papers: Record<string, string>,
+ * updated_at: string, resume_at: string | null, run_id?: string }} BatchControl */
+/** @param {unknown} error */
+const errorMessage = error => error instanceof Error ? error.message : String(error);
 const root = fileURLToPath(new URL('../', import.meta.url));
 const checkOnly = process.argv.includes('--check-only');
 const repairExisting = process.argv.includes('--repair-existing');
@@ -27,59 +40,64 @@ const afterAt = process.argv.indexOf('--after');
 const onlyAt = process.argv.indexOf('--only');
 if ((afterAt < 0) === (onlyAt < 0)) throw Error('请指定 --after SPINA-0005 或 --only SPINA-0006,SPINA-0007');
 if (afterAt >= 0 && !/^SPINA-\d{4}$/.test(process.argv[afterAt + 1] ?? '')) throw Error('用法：npm run batch -- --after SPINA-0005');
-const after = afterAt >= 0 ? Number(process.argv[afterAt + 1].slice(-4)) : null;
+const after = afterAt >= 0 ? Number(process.argv[afterAt + 1].slice(-4)) : 0;
 const onlyIds = onlyAt >= 0 ? (process.argv[onlyAt + 1] ?? '').split(',') : null;
 if (onlyIds && (!onlyIds.length || onlyIds.some(id => !/^SPINA-\d{4}$/.test(id)) || new Set(onlyIds).size !== onlyIds.length)) throw Error('--only 需要逗号分隔的唯一 SPINA-#### ID');
 const distillConfig = deepSeekConfig();
 const extractionDirectory = resolve(root, 'data/distillation/batch');
 const directory = jobId ? resolve(extractionDirectory, 'jobs', jobId) : extractionDirectory;
 await mkdir(directory, { recursive: true });
-const save = async (name, value) => { const path=resolve(directory,name);await writeFile(path+'.tmp',JSON.stringify(value,null,2)+'\n');await rename(path+'.tmp',path); };
-const load = async (path, fallback) => { try { return JSON.parse(await readFile(path, 'utf8')); } catch (error) { if (error.code === 'ENOENT') return fallback; throw error; } };
-const catalog = await readFile(resolve(root, 'data/literature/selected-500.jsonl'), 'utf8')
-  .then(text => text.split(/\r?\n/).filter(Boolean).map(JSON.parse), error => {
-    if (error.code === 'ENOENT') throw Error('未找到 data/literature/selected-500.jsonl：批处理需要论文清单，每行一个 {"paper_id","doi","title"} JSON；单篇论文请用 /distill');
-    throw error;
-  });
-const queue = await load(resolve(directory, 'queue.json'), []);
+/** @param {string} name @param {unknown} value */
+const save = (name, value) => saveJson(resolve(directory, name), value);
+/** @template T @param {string} path @param {T} fallback @returns {Promise<T>} */
+const load = async (path, fallback) => { try { return JSON.parse(await readFile(path, 'utf8')); } catch (error) { if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') return fallback; throw error; } };
+const catalog = await readCatalog(root);
+const queue = await load(resolve(directory, 'queue.json'), /** @type {QueueItem[]} */ ([]));
 for (const item of queue) if (item.status === 'running' || item.status === 'claimed') item.status = 'pending';
 const selectedPapers = onlyIds ? catalog.filter(p => onlyIds.includes(p.paper_id)) : catalog.filter(p => Number(p.paper_id.slice(-4)) > after);
 if (onlyIds && selectedPapers.length !== onlyIds.length) throw Error('--only 中包含不在文献清单中的论文 ID');
 for (const paper of selectedPapers) if (!queue.some(item => item.paper_id === paper.paper_id)) {
+  /** @type {QueueItem} */
   const item={paper_id:paper.paper_id,status:'pending'};
   try { const prepared=await resolvePaper(root,{paper_id:paper.paper_id});await Promise.all(prepared.sources.map(s=>stat(resolve(root,s.path)))); }
-  catch(error){item.status='source_unavailable';item.message=error.message;}
+  catch(error){item.status='source_unavailable';item.message=errorMessage(error);}
   queue.push(item);
 }
 const workItems = onlyIds ? queue.filter(item => onlyIds.includes(item.paper_id)) : queue;
 if (onlyIds) for (const item of workItems) if (item.status !== 'already_published') item.status = 'pending';
 await save('queue.json', queue);
-const registry = new ModelRegistry(await ModelRuntime.create({ credentials: AuthStorage.create(), modelsStorePath: resolve(root, '.runtime/model-store.json') }));
+const registry = new ModelRegistry(await ModelRuntime.create({ modelsStorePath: resolve(root, '.runtime/model-store.json') }));
 const model = registry.find(SOL_POLICY.provider, SOL_POLICY.model);
 const verifierLabel = SOL_LABEL;
 if (!distillOnly && (!model || !registry.hasConfiguredAuth(model))) throw Error('请先在SpinA完成ChatGPT OAuth登录');
 const concurrency = Number(process.env.SPINA_BATCH_CONCURRENCY ?? 2);
 if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 4) throw Error('SPINA_BATCH_CONCURRENCY 必须是 1–4 的整数');
+/** @type {BatchControl} */
 const control = { status: 'running', mode: distillOnly ? 'distill_only' : checkOnly ? 'check_existing_drafts' : repairExisting ? 'repair_existing_drafts' : 'distill_and_verify', model: verifierLabel, reasoning: SOL_POLICY.reasoning, distillation_model: `deepseek/${distillConfig.model}`, distillation_reasoning: distillConfig.effort, concurrency, current_paper: null, current_stage: null, active_papers: {}, updated_at: '', resume_at: null };
+/** @param {unknown} value */
 const emit = value => console.log(JSON.stringify(value));
 let snapshots=Promise.resolve();
-const snapshot = () => { control.updated_at = new Date().toISOString();const state={...structuredClone(control),counts:Object.fromEntries([...new Set(queue.map(x=>x.status))].map(s=>[s,queue.filter(x=>x.status===s).length]))},items=structuredClone(queue);snapshots=snapshots.then(async()=>{await save('state.json',state);await save('queue.json',items);});return snapshots; };
+const snapshot = () => { control.updated_at = new Date().toISOString();const state={...structuredClone(control),counts:Object.fromEntries([...new Set(queue.map(x=>x.status))].map(s=>[s,queue.filter(x=>x.status===s).length]))},items=structuredClone(queue);snapshots=snapshots.catch(()=>{}).then(async()=>{await save('state.json',state);await save('queue.json',items);});return snapshots; };
 let stopRequested = false;
-const stopFileRequested = async () => Boolean((await load(resolve(directory, 'control.json'), {})).stop);
+const stopFileRequested = async () => Boolean((await load(resolve(directory, 'control.json'), /** @type {{stop?: boolean}} */ ({}))).stop);
+/** @param {QueueItem} item @param {number} milliseconds */
 const waitForItem = async (item, milliseconds) => {
-  item.resume_at = new Date(Date.now() + milliseconds).toISOString();
+  const resumeAt = Date.now() + milliseconds;
+  item.resume_at = new Date(resumeAt).toISOString();
   await snapshot();
-  while (Date.now() < Date.parse(item.resume_at)) {
-    await new Promise(done => setTimeout(done, Math.min(10000, Date.parse(item.resume_at) - Date.now())));
+  while (Date.now() < resumeAt) {
+    await new Promise(done => setTimeout(done, Math.min(10000, resumeAt - Date.now())));
     if (await stopFileRequested()) { stopRequested = true; return false; }
   }
   delete item.resume_at;
   return true;
 };
+/** @param {number} milliseconds @param {string} status */
 const waitBeforeWorkers = async (milliseconds, status) => {
-  control.status = status; control.resume_at = new Date(Date.now() + milliseconds).toISOString(); await snapshot();
-  while (Date.now() < Date.parse(control.resume_at)) {
-    await new Promise(done => setTimeout(done, Math.min(30000, Date.parse(control.resume_at) - Date.now())));
+  const resumeAt = Date.now() + milliseconds;
+  control.status = status; control.resume_at = new Date(resumeAt).toISOString(); await snapshot();
+  while (Date.now() < resumeAt) {
+    await new Promise(done => setTimeout(done, Math.min(30000, resumeAt - Date.now())));
     if (await stopFileRequested()) { stopRequested = true; break; }
   }
   control.resume_at = null; control.status = stopRequested ? 'stopped' : 'running';
@@ -96,6 +114,7 @@ if(process.argv.includes('--require-five-current')){
   }
 }
 
+/** @param {QueueItem} item */
 const processItem = async item => {
   control.active_papers[item.paper_id] = 'preparing';
   control.current_paper = item.paper_id; control.current_stage = 'preparing'; item.status = 'running'; await snapshot();
@@ -107,23 +126,25 @@ const processItem = async item => {
       prepared = await resolvePaper(root, { paper_id: item.paper_id });
       await Promise.all(prepared.sources.map(s => stat(resolve(root, s.path))));
     } catch (error) {
-      item.status = 'source_unavailable'; item.message = error.message; item.finished_at = new Date().toISOString();
+      item.status = 'source_unavailable'; item.message = errorMessage(error); item.finished_at = new Date().toISOString();
       await snapshot(); emit({ event: 'paper_finished', ...item }); return;
     }
     const versions = await Promise.all(prepared.sources.map(source => sourceVersion(root, source.path)));
     const cachePath = resolve(directory, item.paper_id + '-calls.json');
-    let cache = await load(cachePath, null);
-    if (!cache && jobId && reuseDraft) cache = await load(resolve(extractionDirectory, item.paper_id + '-calls.json'), null);
-    let savedExtraction;
-    if (reuseDraft) {
-      savedExtraction = checkedExtraction(await load(resolve(extractionDirectory, item.paper_id + '-distill-last.json'), null), cache, versions);
-    }
-    if (!sameSourceVersions(cache?.source_versions, versions)) cache = { source_versions: versions, requests: [] };
+    let existingCache = await load(cachePath, /** @type {CallCache | null} */ (null));
+    if (!existingCache && jobId && reuseDraft) existingCache = await load(resolve(extractionDirectory, item.paper_id + '-calls.json'), /** @type {CallCache | null} */ (null));
+    const savedExtraction = reuseDraft
+      ? checkedExtraction(await load(resolve(extractionDirectory, item.paper_id + '-distill-last.json'), /** @type {SavedExtraction | null} */ (null)), existingCache, versions) : null;
+    /** @type {CallCache} */
+    let cache = existingCache && sameSourceVersions(existingCache.source_versions, versions) ? existingCache : { source_versions: versions, requests: [] };
+    cache = compactCallCache(cache);
     let transientFailures = 0;
     while (true) {
       if (stopRequested || await stopFileRequested()) { stopRequested = true; item.status = 'pending'; return; }
       if (!sameSourceVersions(versions, await Promise.all(prepared.sources.map(source => sourceVersion(root, source.path))))) throw Error('等待期间来源已改变，请重新启动任务；不会将旧缓存绑定到新来源');
+    /** @type {unknown} */
     let resourceError = null;
+    /** @type {import('./distillation/agents.ts').ModelCall} */
     const call = async request => {
       if (distillOnly && request.stage !== 'distill') {
         if (request.stage === 'verify') {
@@ -132,39 +153,48 @@ const processItem = async item => {
         }
         throw Error('只蒸馏模式不执行修正');
       }
-      if (reuseDraft && request.stage === 'distill') {
+      if (savedExtraction && request.stage === 'distill') {
         emit({ paper_id: item.paper_id, stage: 'distill', event: 'reuse_existing_deepseek_draft', model: savedExtraction.metadata.model, reasoning: savedExtraction.metadata.reasoning });
         return savedExtraction.output;
       }
       if (checkOnly && request.stage === 'repair') throw Error('只检查模式不执行修正');
       const modelKey = batchModelKey(request.stage, verifierLabel, distillConfig);
-      const cached = cache.requests.find(c => c.model_key === modelKey && c.stage === request.stage && c.system === request.system && c.input === request.input);
+      const requestKey = batchRequestKey(request.system, request.input);
+      const cached = cache.requests.find(c => c.model_key === modelKey && c.stage === request.stage && c.request_key === requestKey);
       if (cached) { validateBatchOutput(request, cached.output); emit({ paper_id: item.paper_id, stage: request.stage, event: 'reuse_verified_output' }); return cached.output; }
       const started = Date.now(); emit({ paper_id: item.paper_id, stage: request.stage, event: 'request_start', model_key: modelKey, images: request.images?.length ?? 0 });
-      let output, metadata;
+      let output;
+      /** @type {CallMetadata | undefined} */
+      let metadata;
       try {
         if (request.stage !== 'verify') {
           output = await createDeepSeekCall(root, distillConfig, { onResult: value => { metadata = value; } })(request);
         } else {
+          if (!model) throw Error('请先在SpinA完成ChatGPT OAuth登录');
           const text = request.system + request.input;
           const outputBudget = Math.min(SOL_POLICY.outputTokens, model.maxTokens);
           const estimate = Math.ceil([...text].reduce((sum, c) => sum + (c.charCodeAt(0) > 127 ? 1.5 : 1 / 3), 0)) + (request.images?.length ?? 0) * 2500 + outputBudget;
           if (estimate > model.contextWindow) throw Error('正文、SI、图像和草稿超出核验模型上下文容量；不截断来源');
-          const result = await registry.streamSimple(model, { systemPrompt: request.system, messages: [{ role: 'user', content: request.images?.length ? [{ type: 'text', text: request.input }, ...await imageContent(root, request.images)] : request.input, timestamp: Date.now() }] }, { transport: 'sse', sessionId: `spina-${item.paper_id}`, reasoning: SOL_POLICY.reasoning, maxTokens: outputBudget, timeoutMs: 1200000, maxRetries: 1, onPayload: payload => { if (payload.model !== SOL_POLICY.model || payload.reasoning?.effort !== SOL_POLICY.reasoning) throw Error('核验模型或推理强度不符合设置'); } }).result();
+          const result = await registry.streamSimple(model, { systemPrompt: request.system, messages: [{ role: 'user', content: request.images?.length ? [{ type: 'text', text: request.input }, ...await imageContent(root, request.images)] : request.input, timestamp: Date.now() }] }, { transport: 'sse', sessionId: `spina-${item.paper_id}`, reasoning: SOL_POLICY.reasoning, maxTokens: outputBudget, timeoutMs: 1200000, maxRetries: 1, onPayload: payload => {
+            if (!payload || typeof payload !== 'object' || !('model' in payload) || payload.model !== SOL_POLICY.model ||
+              !('reasoning' in payload) || !payload.reasoning || typeof payload.reasoning !== 'object' ||
+              !('effort' in payload.reasoning) || payload.reasoning.effort !== SOL_POLICY.reasoning) throw Error('核验模型或推理强度不符合设置');
+          } }).result();
           if (result.stopReason !== 'stop') throw Error(result.errorMessage ?? result.stopReason);
           output = result.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
           metadata = { model: result.model, provider: result.provider, reasoning: SOL_POLICY.reasoning, usage: result.usage, stop_reason: result.stopReason };
         }
       }
       catch (error) { resourceError = error; throw error; }
+      if (!metadata) throw Error('模型未返回调用元数据，无法保存缓存');
       metadata = { ...metadata, seconds: (Date.now() - started) / 1000 };
       await save(`${item.paper_id}-${request.stage}-last.json`, { source_versions: versions, metadata, output }); emit({ paper_id: item.paper_id, stage: request.stage, event: 'request_end', ...metadata });
       validateBatchOutput(request, output);
-      cache.requests.push({ model_key: modelKey, stage: request.stage, system: request.system, input: request.input, output, metadata }); await save(item.paper_id+'-calls.json',cache);
+      cache.requests.push({ model_key: modelKey, stage: request.stage, request_key: requestKey, output, metadata }); cache = compactCallCache(cache); await save(item.paper_id+'-calls.json',cache);
       return output;
     };
-    const run = await runDistillation(root, { paper_id: item.paper_id }, call, { maxRepairs: (checkOnly || distillOnly) ? 0 : 3, focusedRepairs: true, modelLabel: verifierLabel, distillationModelLabel: reuseDraft ? `deepseek/${savedExtraction.metadata.model}:${savedExtraction.metadata.reasoning}` : `deepseek/${distillConfig.model}:${distillConfig.effort}`, onProgress: run => { control.active_papers[item.paper_id] = run.stage; control.current_paper = item.paper_id; control.current_stage = run.stage; control.run_id = run.run_id; void snapshot(); } });
-    if (reuseDraft) {
+    const run = await runDistillation(root, { paper_id: item.paper_id }, call, { maxRepairs: (checkOnly || distillOnly) ? 0 : 3, focusedRepairs: true, modelLabel: verifierLabel, distillationModelLabel: savedExtraction ? `deepseek/${savedExtraction.metadata.model}:${savedExtraction.metadata.reasoning}` : `deepseek/${distillConfig.model}:${distillConfig.effort}`, onProgress: run => { control.active_papers[item.paper_id] = run.stage; control.current_paper = item.paper_id; control.current_stage = run.stage; control.run_id = run.run_id; void snapshot().catch(error => { stopRequested = true; emit({ event: 'snapshot_failed', message: errorMessage(error) }); }); } });
+    if (savedExtraction) {
       const provenanceStore = await ExperimentStore.open(root);
       try { await provenanceStore.saveArtifact(run, 'check-input.json', { mode: checkOnly ? 'check_existing_draft' : 'repair_existing_draft', original_output: `data/distillation/batch/${item.paper_id}-distill-last.json`, model: savedExtraction.metadata.model, reasoning: savedExtraction.metadata.reasoning, source_versions: versions, new_distillation_calls: 0 }); }
       finally { provenanceStore.close(); }
@@ -191,7 +221,7 @@ const processItem = async item => {
     item.finished_at = new Date().toISOString(); await snapshot(); emit({ event: 'paper_finished', ...item }); break;
     }
   } catch (error) {
-    item.status = 'failed'; item.message = error.message; item.error_kind = classifyError(error); item.finished_at = new Date().toISOString();
+    item.status = 'failed'; item.message = errorMessage(error); item.error_kind = classifyError(error); item.finished_at = new Date().toISOString();
     await snapshot(); emit({ event: 'paper_finished', ...item });
   } finally {
     delete control.active_papers[item.paper_id];

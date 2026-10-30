@@ -1,0 +1,8 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true
+  },
+  "include": ["src/batch.mjs", "src/batch-io.mjs", "src/batch-retry.mjs"]
+}

@@ -72,17 +72,19 @@ test('repeating a resumed run returns its saved result without starting another 
     const resumed = store.createRun('TEST-RESUME'); resumed.status = 'published_uncertain'; store.saveRun(resumed);
     await store.saveArtifact(prior, 'resumed_run.json', { run_id: resumed.run_id }); store.close();
     const tools = new Map();
-    spina({ registerTool: tool => tools.set(tool.name, tool), registerCommand: () => {}, on: () => {} });
+    spina({ registerMarkdownTransformer: () => {}, registerTool: tool => tools.set(tool.name, tool), registerCommand: () => {}, on: () => {} });
     // No model registry or credentials: a repeated resume must not need either.
     const result = await tools.get('resume_distillation_run').execute('resume', { run_id: prior.run_id }, undefined, undefined, { cwd: root });
     assert.equal(result.details.run_id, resumed.run_id);
     assert.equal(result.details.status, 'published_uncertain');
+    await assert.rejects(tools.get('resume_distillation_run').execute('resume', { run_id: prior.run_id, feedback: 'New concern' }, undefined, undefined, { cwd: root }), /未应用/);
+    await assert.rejects(tools.get('resume_distillation_run').execute('resume', { run_id: prior.run_id, repair_round: 2 }, undefined, undefined, { cwd: root }), /未应用/);
   } finally { await cleanup(root); }
 });
 
 test('registers native tools and validates slash-command input before starting a turn', async () => {
   const tools = new Map(); const commands = new Map(); const sent = [];
-  spina({ registerTool: tool => tools.set(tool.name, tool), registerCommand: (name, command) => commands.set(name, command), on: () => {}, sendUserMessage: async message => sent.push(message) });
+  spina({ registerMarkdownTransformer: () => {}, registerTool: tool => tools.set(tool.name, tool), registerCommand: (name, command) => commands.set(name, command), on: () => {}, sendUserMessage: async message => sent.push(message) });
   assert.ok(tools.has('distill_paper') && tools.has('inspect_paper_sources') && tools.has('get_distillation_result') && tools.has('search_spinel_experiments'));
   const messages = [];
   const ctx = { ui: { notify: message => messages.push(message) } };
@@ -116,7 +118,7 @@ test('native tool distills through DeepSeek and independently verifies through P
       assert.equal(body.model, 'deepseek-flash'); assert.equal(body.reasoning_effort, 'high');
       return Response.json({ choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(draft) } }] });
     });
-    spina({ registerTool: tool => tools.set(tool.name, tool), registerCommand: () => {}, on: () => {}, getThinkingLevel: () => 'off' });
+    spina({ registerMarkdownTransformer: () => {}, registerTool: tool => tools.set(tool.name, tool), registerCommand: () => {}, on: () => {}, getThinkingLevel: () => 'off' });
     const solModel = { provider: 'openai-codex', id: 'gpt-6.1-sol', maxTokens: 8000, contextWindow: 128000 };
     const ctx = {
       cwd: root, hasUI: false, thinkingLevel: 'off',

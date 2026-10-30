@@ -212,6 +212,21 @@ export class ExperimentStore {
     return row ? JSON.parse(row.record_json) as PublishedRecord : null;
   }
 
+  readPublishedVersions(includeUncertain = true) {
+    const rows = this.db.prepare("SELECT paper_id, record_json, 'verified' AS version FROM papers ORDER BY paper_id").all() as { paper_id: string; record_json: string; version: RecordReference['version'] }[];
+    if (includeUncertain && this.hasUncertainTable) rows.push(...this.db.prepare("SELECT paper_id, record_json, 'uncertain' AS version FROM uncertain_papers ORDER BY paper_id").all() as typeof rows);
+    const records: { record: PublishedRecord; version: RecordReference['version'] }[] = [];
+    const warnings: { paper_id: string; version: string; message: string }[] = [];
+    for (const row of rows) {
+      try {
+        const record = JSON.parse(row.record_json) as PublishedRecord;
+        if (record.paper.paper_id !== row.paper_id || !Array.isArray(record.draft.samples) || !Array.isArray(record.match_entries)) throw new Error('记录结构无效');
+        records.push({ record, version: row.version });
+      } catch { warnings.push({ paper_id: row.paper_id, version: row.version, message: '记录损坏或结构不完整，已跳过；筛选范围不完整' }); }
+    }
+    return { records, warnings };
+  }
+
   getPaperState(paperId: string): PaperState {
     const query = "SELECT 'verified' AS version, record_json FROM papers WHERE paper_id = ?" +
       (this.hasUncertainTable ? " UNION ALL SELECT 'uncertain' AS version, record_json FROM uncertain_papers WHERE paper_id = ?" : '');
@@ -225,15 +240,20 @@ export class ExperimentStore {
     const { includeUncertain = true, limit = 20, offset = 0, match = 'exact' } = options;
     const elements = [...new Set(metals)].sort();
     const key = elements.join('|');
-    if (!metals.length || deriveMetalElements([...new Set(metals)].sort().join(''))?.join('|') !== key) throw new Error('请提供有效的金属元素符号集合');
+    const invalid = elements.filter(element => deriveMetalElements(element)?.join('|') !== element);
+    if (!metals.length || invalid.length) throw new Error(`请提供有效的金属元素符号集合${invalid.length ? `：${invalid.join('、')} 不是金属元素符号` : ''}`);
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error('limit 必须为 1–100');
     if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('offset 必须为非负安全整数');
     if (match !== 'exact' && match !== 'superset') throw new Error('match 必须为 exact 或 superset');
-    const rows = this.db.prepare("SELECT record_json, 'verified' AS version FROM papers ORDER BY paper_id").all() as { record_json: string; version: RecordReference['version'] }[];
-    if (includeUncertain && this.hasUncertainTable) rows.push(...this.db.prepare("SELECT record_json, 'uncertain' AS version FROM uncertain_papers ORDER BY paper_id").all() as typeof rows);
+    const rows = this.db.prepare("SELECT paper_id, record_json, 'verified' AS version FROM papers ORDER BY paper_id").all() as { paper_id: string; record_json: string; version: RecordReference['version'] }[];
+    if (includeUncertain && this.hasUncertainTable) rows.push(...this.db.prepare("SELECT paper_id, record_json, 'uncertain' AS version FROM uncertain_papers ORDER BY paper_id").all() as typeof rows);
     const exact: ExperimentSearchResult[] = [], related: ExperimentSearchResult[] = [];
+    const warnings: { paper_id: string; version: string; message: string }[] = [];
     for (const row of rows) {
+      const exactStart = exact.length, relatedStart = related.length;
+      try {
       const record = JSON.parse(row.record_json) as PublishedRecord;
+      if (record.paper.paper_id !== row.paper_id || !Array.isArray(record.match_entries)) throw new Error('记录身份或匹配条目无效');
       const unresolved = record.verification.issues.filter(issue => issue.resolution_status !== 'resolved');
       const sourceMessages = sourceInformationMessages(record);
       const knownIssueMessages = new Set(unresolved.map(issueText));
@@ -280,6 +300,10 @@ export class ExperimentStore {
           ...(scopedReviewNotes.length ? { review_notes: scopedReviewNotes } : {}),
         });
       }
+      } catch {
+        exact.length = exactStart; related.length = relatedStart;
+        warnings.push({ paper_id: row.paper_id, version: row.version, message: '记录损坏或结构不完整，已跳过；本次检索结果不完整，请修复该记录' });
+      }
     }
     const compare = (a: ExperimentSearchResult, b: ExperimentSearchResult) =>
       a.paper.paper_id.localeCompare(b.paper.paper_id) ||
@@ -296,6 +320,7 @@ export class ExperimentStore {
       group.total++; sets.set(key, group);
     }
     return {
+      ...(warnings.length ? { warnings } : {}),
       metal_elements: elements, match, total: matches.length, offset, limit,
       has_more: next < matches.length, next_offset: next < matches.length ? next : null, results,
       related: { total: related.length, uncertain: related.filter(row => row.certainty === 'uncertain').length,

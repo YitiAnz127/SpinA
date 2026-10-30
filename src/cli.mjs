@@ -45,6 +45,7 @@ export function main(args = process.argv.slice(2)) {
       cwd: options.cwd,
       env: options.env,
       stdio: "inherit",
+      windowsHide: true,
     });
     // Pi receives Ctrl+C directly from the terminal and handles cancellation.
     const onInterrupt = () => {};
@@ -60,7 +61,8 @@ export function main(args = process.argv.slice(2)) {
     });
     return child;
   } catch (error) {
-    console.error(`SpinA 启动失败：${error.message}\n请先在项目目录运行 npm install。`);
+    const hint = ['ERR_MODULE_NOT_FOUND', 'MODULE_NOT_FOUND'].includes(error.code) ? '\n请先在项目目录运行 npm install。' : '';
+    console.error(`SpinA 启动失败：${error.message}${hint}`);
     process.exitCode = 1;
   }
 }

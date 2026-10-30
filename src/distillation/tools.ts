@@ -7,11 +7,14 @@ import type { ModelCall } from './agents.ts';
 import { runDistillation, matchingEntries } from './pipeline.ts';
 import { ExperimentStore, deliveryRecord, type RecordReference } from './store.ts';
 import { resolvePaper, readSources } from './documents.ts';
-import { imageContent } from './images.ts';
+import { imageContent, renderSourcePages } from './images.ts';
 import { createDeepSeekCall, deepSeekConfig, routeDistillationCalls } from './deepseek.ts';
 import { SOL_POLICY, SOL_LABEL } from '../model-policy.ts';
 import { applyFocusedRepair, parseModelJson } from './schema.ts';
 import { classifyError } from '../errors.ts';
+import { readSamplePreparation } from './preparation.ts';
+import { readPreparationEvidence } from './evidence.ts';
+import { searchPreparationConditions, PreparationConditionQuerySchema } from './conditions.ts';
 
 const id = Type.String({ pattern: '^[A-Za-z0-9_-]{1,80}$' });
 const SourceInputSchema = Type.Object({
@@ -122,7 +125,10 @@ export function registerDistillationTools(pi: ExtensionAPI): void {
         const resumed = JSON.parse(await readFile(resolve(ctx.cwd, 'data/distillation/runs', params.run_id, 'resumed_run.json'), 'utf8')) as { run_id: string };
         const existing = store?.getRun(resumed.run_id);
         if (!existing) throw new Error('已续接任务的状态缺失，不能重置修正上限');
-        if (!(params.recheck_cached && prior?.status === 'published_uncertain')) return response(existing);
+        if (!(params.recheck_cached && prior?.status === 'published_uncertain')) {
+          if (params.feedback !== undefined || params.repair_round !== undefined) throw new Error(`该任务已续接为 ${existing.run_id}；本次 feedback／repair_round 未应用。请针对续接任务继续修正，或使用 recheck_cached 重新核验已有疑惑版`);
+          return response(existing);
+        }
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
       } finally { store?.close(); }
@@ -206,13 +212,14 @@ export function registerDistillationTools(pi: ExtensionAPI): void {
       const prepared = params.path ? { sources: [{ path: params.path }], paper: undefined }
         : params.paper_id ? await resolvePaper(ctx.cwd, { ...params, paper_id: params.paper_id }) : undefined;
       if (!prepared) throw new Error('请提供 paper_id 或 data/paper 内的 path');
-      const sources = await readSources(ctx.cwd, prepared.sources, signal, { renderImages: true, allowSI: true });
+      const sources = await readSources(ctx.cwd, prepared.sources, signal, { allowSI: true });
       const source = sources.find(source => source.id === (params.source_id ?? 'src_1'));
       if (!source) throw new Error('指定的 source_id 不存在，请先检查来源');
       const first = params.first_page ?? 1;
       const last = params.last_page ?? Math.min(first + 4, source.pages.length);
       if (!Number.isInteger(first) || !Number.isInteger(last) || first < 1 || last < first || last > source.pages.length || last - first >= 20) throw new Error('页码范围无效或超过 20 页');
       const pages = source.pages.filter(page => page.number >= first && page.number <= last);
+      await renderSourcePages(ctx.cwd, { ...source, pages }, signal);
       const details = { ...(prepared.paper ? { paper: prepared.paper } : {}), source: { id: source.id, path: source.path, kind: source.kind, page_count: source.pages.length }, pages };
       const content = await imageContent(ctx.cwd, pages.flatMap(page => page.image_path ? [{ path: page.image_path, source_id: source.id, page: page.number }] : []));
       const result = response(details);
@@ -274,11 +281,45 @@ export function registerDistillationTools(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
+    name: 'get_sample_preparation', label: '展开样品制备流程',
+    description: '按搜索或详情返回的record_ref和sample_id，只读取所选样品及其shared_from祖先，按祖先到自身排列。保留各层原料、步骤顺序、变量、短引文、字段ID和限定及论文级notes；不会自动合并步骤或覆盖条件。由主模型结合各层差异组织具体方法。缺省status表示reported，省略的空字段不代表明确禁止继承；显式未知和note限定必须保留。只读数据库，不调用模型或读取PDF。',
+    promptSnippet: '展开一个具体样品的制备方法，取齐其自身和明确共用的祖先流程。',
+    promptGuidelines: ['具体展开搜索命中的样品时，复制该条record_ref全部字段和sample_id调用本工具。', '先读论文级notes及各层note，再组织共用步骤和样品差异；不按同名参数或样品数组顺序机械拼接。', '无法确定条件适用步骤时保留限定；子样品明确的未知条件不能被父流程确定值填补。'],
+    parameters: Type.Object({
+      record_ref: Type.Object({
+        paper_id: id, version: Type.Union([Type.Literal('verified'), Type.Literal('uncertain')]),
+        revision: Type.Integer({ minimum: 1 }), verified_at: Type.String({ minLength: 1 }),
+      }, { additionalProperties: false }),
+      sample_id: Type.String({ minLength: 1 }),
+    }, { additionalProperties: false }),
+    annotations: { readOnlyHint: true, openWorldHint: false },
+    execute: async (_callId, params, signal, _onUpdate, ctx) =>
+      response(await readSamplePreparation(ctx.cwd, params.record_ref, params.sample_id, signal)),
+  });
+
+  pi.registerTool({
+    name: 'get_preparation_evidence', label: '反查制备字段证据',
+    description: '按完整record_ref、目标sample_id和field_path读取库内原始Fact及短引文，不读取PDF或页图。路径以samples.<所属样品ID>开头，后接method、variables.<名称>、materials.<ID>.identity/amount/concentration、phases.<ID>.formula/identity/metal_elements、steps.<ID>.operation/description或steps.<ID>.conditions.<名称>。使用流程输出中的实际ID/名称，不用数组下标。仅允许目标样品及shared_from祖先。fields列表逐项保留source_sample_id、fact及步骤上下文；同名字段有多项时全部返回并标ambiguous=true，不能任取一项。祖先证据不自动证明可用于子样品；has_recorded_content=false表示空默认字段，不能据此断言原文未报告。',
+    promptSnippet: '反查一个制备字段的原值、状态、限定及库存短引文。',
+    promptGuidelines: ['用户追问某个条件的依据时，先从样品流程定位所属对象，再按实际field_path反查。', '读取fields每项的fact.evidence，仅引用实际保存的quote；同名字段有多项时逐项保留限定，不擅自合并或选择。没有短引文就说明，不能编造或声称新核对过原件。', '结合context判断祖先条件是否适用于子样品；basis=page_image只表示历史取证方式，本次没有打开图像。'],
+    parameters: Type.Object({
+      record_ref: Type.Object({ paper_id: id,
+        version: Type.Union([Type.Literal('verified'), Type.Literal('uncertain')]),
+        revision: Type.Integer({ minimum: 1 }), verified_at: Type.String({ minLength: 1 }),
+      }, { additionalProperties: false }),
+      sample_id: Type.String({ minLength: 1 }), field_path: Type.String({ minLength: 1 }),
+    }, { additionalProperties: false }),
+    annotations: { readOnlyHint: true, openWorldHint: false },
+    execute: async (_callId, params, signal, _onUpdate, ctx) =>
+      response(await readPreparationEvidence(ctx.cwd, params.record_ref, params.sample_id, params.field_path, signal)),
+  });
+
+  pi.registerTool({
     name: 'search_spinel_experiments', label: '检索尖晶石制备实验',
     description: '按目标相金属集合检索，返回results、total、next_offset和has_more。默认exact，related提示含额外金属的体系，superset可分页查看补充案例。method_summary列大纲，record_ref绑定版本。missing_information/source_limitations在回答中体现，只有issues标抽取问题；certainty是存储版本，不直接作为疑惑判断。possible=true始终只表示可能匹配。total按版本/样品/相计数。',
     parameters: Type.Object({
       metal_elements: Type.Array(Type.String({ pattern: '^[A-Z][a-z]?$' }), { minItems: 1, maxItems: 12 }),
-      include_uncertain: Type.Optional(Type.Boolean()), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+      include_uncertain: Type.Optional(Type.Boolean({ default: true, description: '默认 true：包含历史待核对版本和可能匹配；false 同时排除两类。' })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
       offset: Type.Optional(Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER })),
       match: Type.Optional(Type.Union([Type.Literal('exact'), Type.Literal('superset')])),
     }, { additionalProperties: false }),
@@ -295,6 +336,16 @@ export function registerDistillationTools(pi: ExtensionAPI): void {
       })); }
       finally { store.close(); }
     },
+  });
+
+  pi.registerTool({
+    name: 'search_preparation_conditions', label: '跨库筛选制备条件',
+    description: '只读库内结构化记录，温度/时长/原料至少提供一种；step_terms仅作附加过滤，不能单独检索步骤词。temperature输入为°C；duration默认h，可s/min/h/d，至少给min或max，边界默认包含。单值常见单位自动比较；范围、未知、多值、继承及限定进入needs_review。step_terms按步骤ID/操作/描述OR匹配，搭配原料条件同样生效。原料组间AND，别名组内OR；not_listed仅表示库内未列出。include_uncertain默认true，包含待核对版本及可能匹配，false同时排除两类。可附金属exact或严格superset。total按版本/样品计数，field_matches是字段支持数，needs_review另计；均须展开后核对适用范围。返回record_ref和字段证据分页；unevaluable_samples表示无可比较字段，不能当作不符合。',
+    promptSnippet: '跨论文按已记录温度、时长、原料筛选可展开核对的制备候选。',
+    promptGuidelines: ['温度和时长默认要求出现在同一步骤；不能把干燥温度与另一煅烧步骤的时长拼成命中。', '字段命中不等于整条路线最高温度或总时长满足；需按record_ref和sample_id调用get_sample_preparation展开，再按需反查。', 'not_listed不能答成实际未使用。报告field_matches、needs_review和unevaluable_samples，分页未读完不得声称列全。'],
+    parameters: PreparationConditionQuerySchema,
+    annotations: { readOnlyHint: true, openWorldHint: false },
+    execute: async (_callId, params, signal, _onUpdate, ctx) => response(await searchPreparationConditions(ctx.cwd, params, signal)),
   });
 
   pi.registerCommand('distill', {

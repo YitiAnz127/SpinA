@@ -2,8 +2,10 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { registerDistillationTools } from './distillation/tools.ts';
 import { deepSeekConfig } from './distillation/deepseek.ts';
 import { SOL_LABEL } from './model-policy.ts';
+import { assistantMarkdownCompatibility } from './markdown.ts';
 
 export default function spina(pi: ExtensionAPI) {
+  pi.registerMarkdownTransformer(assistantMarkdownCompatibility);
   registerDistillationTools(pi);
   const showStatus = (ctx: ExtensionContext, state: string) => {
     if (ctx.hasUI) ctx.ui.setStatus("spina", `SpinA · ${state}`);

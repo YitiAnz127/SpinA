@@ -259,12 +259,12 @@ export async function runDistillation(root: string, input: DistillInput, modelCa
           await store.saveArtifact(run, `repair_error_${repairAttempts}.json`, { message: repairError, ...(lastResponse !== beforeResponse && lastResponse?.stage === 'repair' ? { response: lastResponse.response } : {}) });
         }
       }
-      if (!repaired) return repairAttempts === 3 ? await fallback(repairError) : finish('needs_review', `修正未能形成可检查版本：${repairError}`);
+      if (!repaired) return repairAttempts === maxRepairs && maxRepairs >= 2 ? await fallback(repairError) : finish('needs_review', `修正未能形成可检查版本：${repairError}`);
     }
   } catch (error) {
     const cancelled = !!options.signal?.aborted;
     if (lastResponse && !cancelled) await store.saveArtifact(run, 'last_model_output.json', lastResponse);
-    if (!cancelled && !publicationStarted && repairAttempts > 0 && repairAttempts === maxRepairs && fallback) {
+    if (!cancelled && !publicationStarted && maxRepairs >= 2 && repairAttempts === maxRepairs && fallback) {
       try { return await fallback(`修正后的处理未完成：${(error as Error).message}`); }
       catch (publishError) { return finish('failed', (publishError as Error).message, classifyError(publishError)); }
     }

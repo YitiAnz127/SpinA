@@ -6,6 +6,7 @@ import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
 import type { PaperIdentity, SourceDocument } from './schema.ts';
 import { renderSourcePages } from './images.ts';
 import { extractPdf } from './pdf-extraction.ts';
+import { readCatalog } from './catalog.ts';
 
 export interface SourceInput { path: string; kind?: 'body' | 'si' }
 export interface DistillInput {
@@ -17,18 +18,13 @@ export interface DistillInput {
 
 export async function resolvePaper(root: string, input: DistillInput): Promise<{ paper: PaperIdentity; sources: SourceInput[] }> {
   if (!/^[A-Za-z0-9_-]{1,80}$/.test(input.paper_id)) throw new Error('paper_id 只能包含字母、数字、下划线和连字符');
-  const catalogPath = resolve(root, 'data/literature/selected-500.jsonl');
-  let catalog: PaperIdentity[] = [];
-  try {
-    catalog = (await readFile(catalogPath, 'utf8')).split(/\r?\n/).filter(line => line.trim()).map(line => JSON.parse(line) as PaperIdentity);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-  }
+  const catalog = await readCatalog(root, true);
   const entry = catalog.find(paper => paper.paper_id === input.paper_id);
-  const doi = input.doi?.trim().toLowerCase() ?? entry?.doi.toLowerCase();
+  if (entry && (typeof entry.doi !== 'string' || !/^10\.\d{4,9}\/\S+$/i.test(entry.doi.trim()) || typeof entry.title !== 'string' || !entry.title.trim())) throw new Error(`题录 ${input.paper_id} 缺少有效 DOI 或题名，请修正 selected-500.jsonl`);
+  const doi = input.doi?.trim().toLowerCase() ?? entry?.doi.trim().toLowerCase();
   const title = input.title?.trim() ?? entry?.title;
   if (!doi || !/^10\.\d{4,9}\/\S+$/i.test(doi) || !title) throw new Error('新论文必须提供真实 DOI、题名及 sources；已收录论文可以只提供 paper_id');
-  if (entry && (doi !== entry.doi.toLowerCase() || title !== entry.title)) throw new Error('题录与现有 paper_id 不一致，请使用正确 ID');
+  if (entry && (doi !== entry.doi.trim().toLowerCase() || title !== entry.title)) throw new Error('题录与现有 paper_id 不一致，请使用正确 ID');
   const paper = { paper_id: input.paper_id, doi, title };
   if (input.sources?.length) return { paper, sources: input.sources };
   if (!entry) throw new Error('新论文需要明确指定正文和 SI 文件');

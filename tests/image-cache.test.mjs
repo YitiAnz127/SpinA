@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { access, mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { renderSourcePages } from '../src/distillation/images.ts';
@@ -14,22 +14,24 @@ const canRender = renderer && await access(renderer).then(() => true, () => fals
 const timestamp = new Date('2026-10-01T00:00:00.000Z');
 
 function pdf(text) {
-  const stream = `BT /F1 28 Tf 50 700 Td (${text.replace(/[\\()]/g, '\\$&')}) Tj ET`;
+  const texts = Array.isArray(text) ? text : [text];
   const objects = [
     '<< /Type /Catalog /Pages 2 0 R >>',
-    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
-    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
+    `<< /Type /Pages /Kids [${texts.map((_, i) => `${4 + i * 2} 0 R`).join(' ')}] /Count ${texts.length} >>`,
     '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
-    `<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`,
   ];
+  for (const [i, value] of texts.entries()) {
+    const stream = `BT /F1 28 Tf 50 700 Td (${value}) Tj ET`;
+    objects.push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents ${5 + i * 2} 0 R >>`,
+      `<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`);
+  }
   let output = '%PDF-1.4\n';
   const offsets = [0];
   for (const [index, object] of objects.entries()) {
-    offsets.push(Buffer.byteLength(output));
-    output += `${index + 1} 0 obj\n${object}\nendobj\n`;
+    offsets.push(Buffer.byteLength(output)); output += `${index + 1} 0 obj\n${object}\nendobj\n`;
   }
   const xref = Buffer.byteLength(output);
-  output += `xref\n0 6\n0000000000 65535 f \n${offsets.slice(1).map(offset => `${String(offset).padStart(10, '0')} 00000 n \n`).join('')}trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  output += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n${offsets.slice(1).map(offset => `${String(offset).padStart(10, '0')} 00000 n \n`).join('')}trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
   return Buffer.from(output);
 }
 
@@ -97,4 +99,22 @@ test('replacing a PDF with equal size and modification time creates a new page v
   assert.notEqual(originalPath, replacedPath);
   assert.notDeepEqual(await readFile(resolve(root, replacedPath)), originalImage);
   assert.deepEqual(await readFile(resolve(root, originalPath)), originalImage);
+});
+
+test('partial reads render only requested pages, reuse cache and fill missing pages safely under concurrency', { skip: !canRender }, async t => {
+  const root = await fixture(t);
+  const document = await source(root, 'data/paper/multi.pdf', ['PAGE ONE', 'PAGE TWO', 'PAGE THREE']);
+  document.pages = [{ number: 2, text: 'PAGE TWO' }];
+  await renderSourcePages(root, document);
+  const pagePath = resolve(root, document.pages[0].image_path);
+  const directory = resolve(pagePath, '..');
+  assert.deepEqual(await readdir(directory), ['page-2.png']);
+  const before = await stat(pagePath);
+  const next = { ...document, pages: [{ number: 1, text: 'PAGE ONE' }, { number: 2, text: 'PAGE TWO' }] };
+  await Promise.all([renderSourcePages(root, next), renderSourcePages(root, document)]);
+  assert.deepEqual((await readdir(directory)).sort(), ['page-1.png', 'page-2.png']);
+  assert.equal((await stat(pagePath)).mtimeMs, before.mtimeMs);
+  await writeFile(pagePath, 'broken PNG');
+  await renderSourcePages(root, document);
+  assert.ok((await readFile(pagePath)).subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])));
 });

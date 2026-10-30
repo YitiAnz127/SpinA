@@ -359,15 +359,15 @@ test('final delivery selects the best checked revision when later repairs regres
   } finally {await cleanup(root);}
 });
 
-test('malformed repair replies count toward the three-attempt cap without repeating unchanged verification', async () => {
+for (const maxRepairs of [1, 2, 3]) test(`malformed repair replies honor the ${maxRepairs}-attempt cap`, async () => {
   const root=await workspace();
   try {
     const calls=[];
     const result=await runDistillation(root,{...paper,sources:[{path:'data/paper/test.pdf'}]},async request=>{
       calls.push(request.stage);return request.stage==='repair'?'not JSON':JSON.stringify(request.stage==='verify'?badReview():draft());
-    },{readSources:fakeReadSources});
-    assert.equal(result.status,'published_uncertain');assert.deepEqual(calls,['distill','verify','repair','repair','repair']);
-    const store=await ExperimentStore.open(root);assert.equal(store.getPaper(paper.paper_id).draft.samples.length,1);store.close();
+    },{readSources:fakeReadSources,maxRepairs});
+    assert.equal(result.status,maxRepairs >= 2 ? 'published_uncertain' : 'needs_review');assert.deepEqual(calls,['distill','verify',...Array(maxRepairs).fill('repair')]);
+    const store=await ExperimentStore.open(root);assert.equal(store.getPaper(paper.paper_id)?.draft.samples.length ?? 0,maxRepairs >= 2 ? 1 : 0);store.close();
   } finally {await cleanup(root);}
 });
 

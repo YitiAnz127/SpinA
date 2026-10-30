@@ -6,8 +6,23 @@ import { fileURLToPath } from 'node:url';
 import { ExperimentStore } from '../src/distillation/store.ts';
 import { parseDraft } from '../src/distillation/schema.ts';
 import spina from '../src/spina.ts';
+import { DatabaseSync } from 'node:sqlite';
 
 const base = fileURLToPath(new URL('../.runtime/tests/', import.meta.url));
+
+test('corrupt JSON and incomplete records do not hide healthy search results', async t => {
+  const { root, store } = await fixture(t);
+  store.publish(record('GOOD', [sample('s1')]), store.getPaperState('GOOD'));
+  const db = new DatabaseSync(join(root, 'data/distillation/spina.sqlite'));
+  try {
+    const insert = db.prepare('INSERT INTO uncertain_papers (paper_id, record_json) VALUES (?, ?)');
+    insert.run('BAD-JSON', '{broken'); insert.run('BAD-SHAPE', '{}');
+    const result = store.searchByElements(['Fe', 'Ni']);
+    assert.equal(result.total, 1); assert.equal(result.results[0].paper.paper_id, 'GOOD');
+    assert.deepEqual(result.warnings.map(warning => warning.paper_id), ['BAD-JSON', 'BAD-SHAPE']);
+    assert.throws(() => store.searchByElements(['C', 'O']), /C、O/);
+  } finally { db.close(); }
+});
 const fact = raw => ({ raw, evidence: [{ source_id: 'src_1', page: 1, quote: raw }] });
 function sample(id, fields = {}) {
   return parseDraft(JSON.stringify({ assessment: 'original_experiments', samples: [{
@@ -40,7 +55,7 @@ async function fixture(t) {
     await rm(root, { recursive: true, force: true });
   });
   const tools = new Map();
-  spina({ registerTool: tool => tools.set(tool.name, tool), registerCommand: () => {}, on: () => {} });
+  spina({ registerMarkdownTransformer: () => {}, registerTool: tool => tools.set(tool.name, tool), registerCommand: () => {}, on: () => {} });
   const call = async (name, params, cwd = root) => (await tools.get(name).execute('fixture', params, undefined, undefined, { cwd })).details;
   return { root, store, call };
 }

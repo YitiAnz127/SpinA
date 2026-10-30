@@ -3,6 +3,7 @@ import type { SourceVersion } from './distillation/source-version.ts';
 import type { AgentRequest } from './distillation/agents.ts';
 import { applyFocusedRepair, parseDraft, parseVerification } from './distillation/schema.ts';
 import { SpinaError } from './errors.ts';
+import { createHash } from 'node:crypto';
 
 interface SavedExtraction {
   metadata: { provider: string; stop_reason: string; model: string; reasoning: string };
@@ -12,6 +13,17 @@ interface SavedExtraction {
 interface CallCache {
   source_versions: SourceVersion[];
   requests: { stage: string; output: string; metadata: SavedExtraction['metadata'] }[];
+}
+
+export function batchRequestKey(system: string, input: string): string {
+  return createHash('sha256').update(JSON.stringify([system, input])).digest('hex');
+}
+
+/** Migrate legacy cache entries without retaining duplicate source text. */
+export function compactCallCache<T extends { requests: { system?: string; input?: string; request_key?: string }[] }>(cache: T): T {
+  return { ...cache, requests: cache.requests.map(({ system, input, ...entry }) => ({
+    ...entry, request_key: typeof system === 'string' && typeof input === 'string' ? batchRequestKey(system, input) : entry.request_key,
+  })).slice(-32) } as T;
 }
 
 export function sameSourceVersions(saved: SourceVersion[] | undefined, current: SourceVersion[]): boolean {

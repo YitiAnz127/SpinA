@@ -1,7 +1,7 @@
 import type { AgentRequest, ModelCall } from './agents.ts';
 import { imageContent } from './images.ts';
 import { classifyError, SpinaError } from '../errors.ts';
-import { readStoredCredential } from '../../node_modules/@earendil-works/pi-coding-agent/dist/core/auth-storage.js';
+import { readStoredCredential } from '@earendil-works/pi-coding-agent';
 
 export interface DeepSeekConfig {
   apiKey: string;
@@ -66,7 +66,14 @@ export function createDeepSeekCall(root: string, config: DeepSeekConfig, options
       const hint = response.status === 401 ? '认证失败，请检查 DEEPSEEK_API_KEY' : response.status === 402 ? '余额不足，请检查 DeepSeek 账户' : response.status === 429 ? 'rate_limit，稍后重试' : response.status >= 500 ? 'upstream network failure' : '请求被拒绝，请检查参数';
       throw new SpinaError(classifyError({ status: response.status }), `DeepSeek HTTP ${response.status}：${hint}`);
     }
-    const result = await response.json() as { model?: string; usage?: unknown; choices?: { finish_reason?: string; message?: { content?: string } }[] };
+    let result: { model?: string; usage?: unknown; choices?: { finish_reason?: string; message?: { content?: string } }[] };
+    try { result = await response.json(); }
+    catch (error) {
+      if (signal.aborted) throw signal.reason;
+      // Do not include proxy response bodies: they can contain credentials or echoed inputs.
+      throw new SpinaError('network', `DeepSeek 网关返回无效 JSON（HTTP ${response.status}）`, { cause: error });
+    }
+    if (!result || typeof result !== 'object' || !Array.isArray(result.choices)) throw new SpinaError('network', 'DeepSeek 网关响应缺少 choices');
     const choice = result.choices?.[0];
     if (choice?.finish_reason !== 'stop') throw new Error(`DeepSeek 未完整返回 JSON：${choice?.finish_reason ?? 'missing_choice'}`);
     const output = choice.message?.content;

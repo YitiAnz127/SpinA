@@ -11,7 +11,8 @@
     "start": "node --env-file-if-exists=.env src/cli.mjs",
     "batch": "node --env-file-if-exists=.env src/batch.mjs",
     "setup:pdf": "node --env-file-if-exists=.env src/setup-pdf.mjs",
-    "check": "node --check src/cli.mjs && tsc --noEmit",
+    "report": "node --disable-warning=ExperimentalWarning src/report.mjs",
+    "check": "node src/check.mjs && tsc --noEmit && tsc -p tsconfig.batch.json",
     "test": "node --test"
   },
   "dependencies": {
