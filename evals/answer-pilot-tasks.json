@@ -1,0 +1,144 @@
+[
+  {
+    "id": "D01",
+    "kind": "development_answering",
+    "turns": [
+      "请查阅已经入库的 SPINA-0002：有人把样品(a)记成‘在120℃下保温48小时’，这段实验笔记是否准确？请纠正并给出步骤和来源依据。",
+      "那把样品(a)改成样品(c)，我能把所有条件照抄，只改最后煅烧温度吗？说明共用步骤、实际变化和仍不明确的条件。"
+    ],
+    "rubric": [
+      "首轮指出120℃是干燥、350℃/48h是退火，不能跨步骤配条件",
+      "第二轮使用(c)分支及其共用流程，不声称差异为煅烧温度",
+      "不由溶液体积比推定具体目标相计量",
+      "依据库存记录回答，不宣称重新查过PDF"
+    ],
+    "gold_status": "development rubric based on stored records; not an independently validated scientific gold label"
+  },
+  {
+    "id": "D02",
+    "kind": "development_answering",
+    "turns": [
+      "SPINA-0003里，含锶、PCT 17小时的涂层与刮下来的粉末，怎样从共同准备步骤走到各自样品？请说明分支关系，不要把0小时对照或长期OER测试状态误接进去。"
+    ],
+    "rubric": [
+      "展开共同准备到目标样品的祖先流程",
+      "保留17h和含锶分支，不能机械先做0h再做17h",
+      "刮取是后续分支，不把所有分支串成单一路线",
+      "不因电解液含锶就确定锶属于目标相金属"
+    ],
+    "gold_status": "development rubric; source verification pending"
+  },
+  {
+    "id": "D03",
+    "kind": "development_answering",
+    "turns": [
+      "在SPINA-0006中，NiCo2−xRhxO4系列的x=0和x=0.05都应该算Ni、Co、Rh三金属精确匹配吗？分别说明，不要只看通式。",
+      "我要复现x=0.05，请给出制备和保存方法。硝酸盐溶液的具体浓度、用于保存的碱种类和浓度若没依据，就明确列为待确认。"
+    ],
+    "rubric": [
+      "x=0不能算含Rh，x=0.05与x=0分开",
+      "取得具体样品及祖先制备流程",
+      "保留500℃热处理与1h及其具体步骤归属",
+      "不补写硝酸盐溶液浓度和保存碱种类/浓度"
+    ],
+    "gold_status": "development rubric based on stored records"
+  },
+  {
+    "id": "D04",
+    "kind": "development_answering",
+    "turns": [
+      "我想找Ni–Co两种金属恰好匹配、退火温度低于400℃而且同一步保温至少24小时的文献案例。先给方法大纲和样品来源；不要把干燥温度和另一操作的时长凑在一起。",
+      "如果我还要求整条路线最高温度低于400℃、总耗时少于24小时，刚才的命中能直接保证吗？请把确定不符合与信息不足分开。"
+    ],
+    "rubric": [
+      "用严格小于400℃、至少24h并绑定退火步骤的条件查找",
+      "说明当前展示范围，不把当前页当全部",
+      "不将单步条件自动当作全路线条件",
+      "对于已需至少24h保温的候选，总耗时少于24h应明确不符合而非仅说未知"
+    ],
+    "gold_status": "task-logic rubric; no precomputed matching-set gold"
+  },
+  {
+    "id": "D05",
+    "kind": "development_answering",
+    "turns": [
+      "找Ni–Co尖晶石制备中原料表没列尿素的记录。能否据此写成‘这些方法保证完全不使用尿素’？请给少量候选并解释证据能支持到哪一步。"
+    ],
+    "rubric": [
+      "区分库内未列出与实验实际未使用",
+      "不把unknown或not_listed升格为确定否定",
+      "候选对应具体论文/样品，并提示需要完整流程核对"
+    ],
+    "gold_status": "epistemic-boundary rubric; no claim of source re-verification"
+  },
+  {
+    "id": "D06",
+    "kind": "development_answering",
+    "turns": [
+      "比较SPINA-0001的NiCo2O4粉末和SPINA-0002的钴镍氧化物电极(a)：按产物形式、原料依据、步骤和关键温度/时长列差异。最后告诉我，这些文献记录是否足以断言其中一条合成成功率更高。"
+    ],
+    "rubric": [
+      "两条路线不混拼，粉末与电极制备分开",
+      "每条结论绑定相应样品与来源",
+      "不把记录完整或已核验等同于更高实验成功率",
+      "缺失或不确定的配比/相计量保持限定"
+    ],
+    "gold_status": "comparison rubric; source verification pending"
+  },
+  {
+    "id": "Q01",
+    "kind": "public_answering_diagnostic",
+    "turns": [
+      "请回答下面的材料科学问题，无需查询本地论文库。给出简短推导，最后单独一行写 FINAL_ANSWER: 数值（用普通小数或e记数法）。最终数值使用单位 g/cm^3。\n\nGiven $a=0.420 \\mathrm{~nm}$, calculate the density of MgO."
+    ],
+    "public_qid": "Introduction_to_Materials_Science_for_Engineers_Shackelford_Example 3.4"
+  },
+  {
+    "id": "Q02",
+    "kind": "public_answering_diagnostic",
+    "turns": [
+      "请回答下面的材料科学问题，无需查询本地论文库。给出简短推导，最后单独一行写 FINAL_ANSWER: 数值（用普通小数或e记数法）。最终数值使用单位 °。\n\nWhat is the angle between the [110] and [111] directions in the cubic system?"
+    ],
+    "public_qid": "Introduction_to_Materials_Science_for_Engineers_Shackelford_Example 3.11"
+  },
+  {
+    "id": "Q03",
+    "kind": "public_answering_diagnostic",
+    "turns": [
+      "请回答下面的材料科学问题，无需查询本地论文库。给出简短推导，最后单独一行写 FINAL_ANSWER: 数值（用普通小数或e记数法）。最终数值使用单位 g。\n\nIn firing 5 kg of kaolinite, $\\mathrm{Al}_{2}\\left(\\mathrm{Si}_{2} \\mathrm{O}_{5}\\right)(\\mathrm{OH})_{4}$, in a laboratory furnace to produce an aluminosilicate ceramic, how much $\\mathrm{H}_{2} \\mathrm{O}$ is driven off?"
+    ],
+    "public_qid": "Introduction_to_Materials_Science_for_Engineers_Shackelford_Example 11.4"
+  },
+  {
+    "id": "Q04",
+    "kind": "public_answering_diagnostic",
+    "turns": [
+      "请回答下面的材料科学问题，无需查询本地论文库。给出简短推导，最后单独一行写 FINAL_ANSWER: 数值（用普通小数或e记数法）。最终数值使用单位 N。\n\nCalculate the force of attraction between a $\\mathrm{Ca}^{2+}$ and an $O^{2-}$ ion whose centers are separated by a distance of 1.25 nm ."
+    ],
+    "public_qid": "Fundamentals_of_Materials_Instructors_Example 2.15"
+  },
+  {
+    "id": "Q05",
+    "kind": "public_answering_diagnostic",
+    "turns": [
+      "请回答下面的材料科学问题，无需查询本地论文库。给出简短推导，最后单独一行写 FINAL_ANSWER: 数值（用普通小数或e记数法）。最终数值使用单位 g/cm^3。\n\nStrontium (Sr) has an FCC crystal structure, an atomic radius of 0.215 nm and an atomic weight of 87.62 $\\mathrm{g} / \\mathrm{mol}$. Calculate the theoretical density for Sr ."
+    ],
+    "public_qid": "Fundamentals_of_Materials_Instructors_Example 3.8"
+  },
+  {
+    "id": "Q06",
+    "kind": "public_answering_diagnostic",
+    "turns": [
+      "请回答下面的材料科学问题，无需查询本地论文库。给出简短推导，最后单独一行写 FINAL_ANSWER: 数值（用普通小数或e记数法）。最终数值使用单位 J/mol。\n\nCalculate the enthalpy change for an oxide as the average particle diameter increases from 0.5 to $10 \\mu \\mathrm{m}$. Assume the molar volume of the oxide to be $10 \\mathrm{cm}^{3} / \\mathrm{mol}$ and a surface energy of $1 \\mathrm{J} / \\mathrm{m}^{2}$."
+    ],
+    "public_qid": "Fundamentals_of_Ceramics_Barsoum_Example 10.1"
+  },
+  {
+    "id": "Q07",
+    "kind": "public_answering_diagnostic",
+    "turns": [
+      "请回答下面的材料科学问题，无需查询本地论文库。给出简短推导，最后单独一行写 FINAL_ANSWER: 数值（用普通小数或e记数法）。最终数值无单位。\n\nCalculate the atomic packing factor for the FCC crystal structure."
+    ],
+    "public_qid": "Materials_Science_and_Engineering_An_Introduction_Callister_Example 3.2"
+  }
+]

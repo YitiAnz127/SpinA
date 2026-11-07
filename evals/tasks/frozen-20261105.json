@@ -1,0 +1,356 @@
+{
+  "schema_version": 1,
+  "frozen_at": "2026-11-05",
+  "purpose": "试点验收集：证明 SpinA 在真实研究任务上是否节省时间并减少错误。题目在试点开始前冻结，不得在看过结果后修改。",
+  "pilot_scope": "使用仓库自带的演示快照（data/demo/spina.sqlite）作为语料，用于验证流程与评分口径；正式评测必须换成本课题组的留出论文，且与开发集隔离。",
+  "protocol": {
+    "arms": [
+      "spina: 本工具的结构化检索与证据反查",
+      "generic_retrieval: 同一底模 + 通用检索（不接结构化库）",
+      "evidence_pack: 人工挑选的充分证据包直接回答"
+    ],
+    "same_model": true,
+    "same_budget_per_task": true,
+    "blind_review": "关键事实由未参与实现的人复核；评审者先看答案后看来源，独立记录错误",
+    "timing": "记录从读题到提交答案的墙钟时间；人工检索另记完成时间作为效率参照",
+    "reporting": "成功率、严重事实错误、来源支撑、耗时、成本、基础设施失败分别报告；不得只报成功率"
+  },
+  "tasks": [
+    {
+      "id": "M01",
+      "category": "metal_set",
+      "prompt": "找 Ni–Co 尖晶石体系的制备记录，列出前 5 个样品，并说明是否查完了全部结果。",
+      "success_criteria": [
+        "返回的每个样品目标相金属集合恰好是 Co 与 Ni",
+        "明确给出 total 与是否 has_more，未读完时说明还有多少条",
+        "展开至少一个样品的来源论文与 record_ref"
+      ],
+      "severe_errors": [
+        "把含第三种金属的体系当作 exact 命中",
+        "声称已列全但实际只读了第一页"
+      ]
+    },
+    {
+      "id": "M02",
+      "category": "metal_set",
+      "prompt": "我想找 Fe–Mn 体系，但允许含少量额外金属。补充体系里有哪些组合？各有多少条？",
+      "success_criteria": [
+        "使用 superset 而不是 exact",
+        "列出 related.metal_sets 的实际组合与计数",
+        "说明补充体系不等于目标体系"
+      ],
+      "severe_errors": [
+        "把 related 计数当成独立论文数",
+        "把含额外金属的样品直接答成 Fe–Mn 配方"
+      ]
+    },
+    {
+      "id": "M03",
+      "category": "metal_set",
+      "prompt": "只保留确认版，不要待核对记录。Ni–Co 体系还有多少条？",
+      "success_criteria": [
+        "使用 include_uncertain=false",
+        "区分确认版与待核对版的数量变化",
+        "不把待核对版本说成错误记录"
+      ],
+      "severe_errors": [
+        "把 include_uncertain=false 解释成只排除错误记录",
+        "数量与筛选前相同却未说明"
+      ]
+    },
+    {
+      "id": "M04",
+      "category": "metal_set",
+      "prompt": "Zn–Fe 体系里，有没有样品的实际产物不是尖晶石？怎么判断的？",
+      "success_criteria": [
+        "说明只按 target_spinel 角色匹配",
+        "给出相身份与证据页码",
+        "无法确认时明确说无法判断"
+      ],
+      "severe_errors": [
+        "从 XRD 图推断相组成",
+        "把 support 相当成目标相"
+      ]
+    },
+    {
+      "id": "M05",
+      "category": "metal_set",
+      "prompt": "一个都没有的话直接说没有。Al–Cr 尖晶石的制备记录有吗？",
+      "success_criteria": [
+        "返回空结果时明确说明库内没有",
+        "区分“库内没有”与“文献不存在”",
+        "给出可以尝试的替代检索方式"
+      ],
+      "severe_errors": [
+        "编造样品或论文",
+        "把无结果答成“没有相关研究”"
+      ]
+    },
+    {
+      "id": "C01",
+      "category": "conditions",
+      "prompt": "筛 Ni–Co 体系里退火温度低于 400 °C、同一步保温 24 小时以上的记录。",
+      "success_criteria": [
+        "温度与时长要求落在同一步骤",
+        "报告 field_matches、needs_review、unevaluable_samples",
+        "说明字段命中不代表整条路线满足"
+      ],
+      "severe_errors": [
+        "把干燥温度与另一煅烧步骤的时长拼成命中",
+        "把 needs_review 直接答成符合"
+      ]
+    },
+    {
+      "id": "C02",
+      "category": "conditions",
+      "prompt": "找原料表里列了尿素的样品，并说明用量是否可比较。",
+      "success_criteria": [
+        "使用原料字面匹配，组间 AND、组内 OR",
+        "说明 not_listed 只表示库内未列出",
+        "用量缺失时明确说未报告"
+      ],
+      "severe_errors": [
+        "把未列出答成实际未使用",
+        "把不同论文的用量直接合并"
+      ]
+    },
+    {
+      "id": "C03",
+      "category": "conditions",
+      "prompt": "温度写成 350–400 ℃ 这种区间的记录，筛选工具能判断吗？",
+      "success_criteria": [
+        "说明单值换算与区间保留的区别",
+        "区间进入 needs_review 而不是被中点替代",
+        "保留原始表述与证据"
+      ],
+      "severe_errors": [
+        "用区间中点当作原文值",
+        "把区间记录直接判为不符合"
+      ]
+    },
+    {
+      "id": "C04",
+      "category": "conditions",
+      "prompt": "整个流程最高温度不超过 400 ℃、总时长一天内完成的样品有哪些？",
+      "success_criteria": [
+        "说明当前工具只做单步字段筛选",
+        "逐样品展开全部步骤后再判断",
+        "缺少某段时长时返回未知或下界"
+      ],
+      "severe_errors": [
+        "用单步命中回答整条路线满足",
+        "忽略未报告时长的步骤"
+      ]
+    },
+    {
+      "id": "C05",
+      "category": "conditions",
+      "prompt": "共用父流程里的条件，能直接算到子样品头上吗？举一个例子。",
+      "success_criteria": [
+        "说明继承需要展开判断",
+        "给出 source_sample_id 与 field_path",
+        "子样品明确未知时不被父流程填补"
+      ],
+      "severe_errors": [
+        "默认所有子样品继承父流程全部条件",
+        "用父流程数值覆盖子样品未知"
+      ]
+    },
+    {
+      "id": "P01",
+      "category": "comparison",
+      "prompt": "比较两篇论文里的 NiFe2O4 制备路线，列出操作差异和关键缺项。",
+      "success_criteria": [
+        "逐样品列出原料、步骤、温度/时长/气氛",
+        "缺项按样品分别标注",
+        "不合成一套“最佳配方”"
+      ],
+      "severe_errors": [
+        "把两条路线的条件混成一条",
+        "隐去某条路线的缺项"
+      ]
+    },
+    {
+      "id": "P02",
+      "category": "comparison",
+      "prompt": "把三个候选样品做成组会用的对照表，要能说明每个数字来自哪里。",
+      "success_criteria": [
+        "使用候选对照导出",
+        "每个单元格保留样品与字段归属",
+        "导出文件带 record_ref 与查询条件"
+      ],
+      "severe_errors": [
+        "导出表没有版本绑定",
+        "把不同来源的数值合成一格且不标注"
+      ]
+    },
+    {
+      "id": "P03",
+      "category": "comparison",
+      "prompt": "这两个样品哪个煅烧温度更高？差多少？依据是什么？",
+      "success_criteria": [
+        "分别给出两个样品的原始值与单位",
+        "换算时保留原始表述",
+        "给出证据页码"
+      ],
+      "severe_errors": [
+        "单位不同却直接比较数值",
+        "只给结论不给证据"
+      ]
+    },
+    {
+      "id": "P04",
+      "category": "comparison",
+      "prompt": "同一篇论文里不同样品共用哪些步骤？哪些是各自独有的？",
+      "success_criteria": [
+        "按 shared_from 链展开",
+        "明确区分祖先步骤与自身步骤",
+        "不按数组顺序机械拼接"
+      ],
+      "severe_errors": [
+        "把所有步骤串成一条流程",
+        "把子样品独有步骤算作共用"
+      ]
+    },
+    {
+      "id": "P05",
+      "category": "comparison",
+      "prompt": "帮我判断哪个样品更接近我的目标体系，并说明不确定性。",
+      "success_criteria": [
+        "按目标相金属集合与材料状态判断",
+        "列出可能匹配与待核对状态",
+        "明确不确定性与缺项"
+      ],
+      "severe_errors": [
+        "把 possible 当成确定匹配",
+        "忽略待核对状态"
+      ]
+    },
+    {
+      "id": "E01",
+      "category": "evidence_chain",
+      "prompt": "这个 850 °C 是从哪句话来的？给我页码和原文。",
+      "success_criteria": [
+        "给出 source_id、页码与短引文",
+        "说明 evidence_scope=stored_record",
+        "没有引文时明确说没有"
+      ],
+      "severe_errors": [
+        "编造引文或页码",
+        "把库存证据说成本次重新核对原文"
+      ]
+    },
+    {
+      "id": "E02",
+      "category": "evidence_chain",
+      "prompt": "换一个样品看同样的字段，条件还成立吗？",
+      "success_criteria": [
+        "重新绑定 record_ref 与 sample_id",
+        "不沿用上一个样品的字段路径",
+        "差异处保留各自限定"
+      ],
+      "severe_errors": [
+        "跨样品复用同一结论",
+        "忽略祖先与自身的差异"
+      ]
+    },
+    {
+      "id": "E03",
+      "category": "evidence_chain",
+      "prompt": "我加了“温度低于 300 °C”这个约束，原来的结论还成立吗？",
+      "success_criteria": [
+        "重新执行筛选而不是过滤旧答案",
+        "说明约束加在哪个字段",
+        "报告结果数量变化"
+      ],
+      "severe_errors": [
+        "只在文字上删改旧结论",
+        "不重新核对同一步骤约束"
+      ]
+    },
+    {
+      "id": "E04",
+      "category": "evidence_chain",
+      "prompt": "这条记录的版本是什么？如果库更新了，我原来的导出还能用吗？",
+      "success_criteria": [
+        "给出 record_ref 的四个字段",
+        "说明版本更新后需重新检索",
+        "说明旧导出保留当时的版本绑定"
+      ],
+      "severe_errors": [
+        "说会自动读取最新版本",
+        "声称旧导出会自动刷新"
+      ]
+    },
+    {
+      "id": "X01",
+      "category": "edge_cases",
+      "prompt": "这篇论文没有 SI，正文也没写保温时间。你能给出时长吗？",
+      "success_criteria": [
+        "明确回答未报告",
+        "区分 source_missing 与 not_reported",
+        "不推算或从其他样品借用"
+      ],
+      "severe_errors": [
+        "给出推算值并当成原文",
+        "用同系列其他样品填补"
+      ]
+    },
+    {
+      "id": "X02",
+      "category": "edge_cases",
+      "prompt": "正文说 900 °C，SI 表里写 850 °C，以哪个为准？",
+      "success_criteria": [
+        "保留原文冲突，不擅自选定",
+        "分别给出两处证据",
+        "标记为来源限制而不是抽取错误"
+      ],
+      "severe_errors": [
+        "静默选一个值",
+        "把来源冲突记成模型抽取错误"
+      ]
+    },
+    {
+      "id": "X03",
+      "category": "edge_cases",
+      "prompt": "这个样品有目标相，但原料用量全是空的，能用来做配方比较吗？",
+      "success_criteria": [
+        "说明空字段不等于原文未报告",
+        "区分缺项与抽取问题",
+        "给出可用于比较的字段范围"
+      ],
+      "severe_errors": [
+        "把空字段当成 0 或未使用",
+        "声称配方完整"
+      ]
+    },
+    {
+      "id": "X04",
+      "category": "edge_cases",
+      "prompt": "检索结果里有一条标了 uncertain，是不是说明这条记录有错？",
+      "success_criteria": [
+        "说明 uncertain 是历史待核对状态",
+        "区分抽取问题与来源限制",
+        "指出需要看 issues 与 review_notes"
+      ],
+      "severe_errors": [
+        "把 uncertain 直接说成错误",
+        "忽略 issues 内容"
+      ]
+    },
+    {
+      "id": "X05",
+      "category": "edge_cases",
+      "prompt": "没有任何结果时，你怎么确认不是工具坏了？",
+      "success_criteria": [
+        "说明 total=0 与 warnings 的区别",
+        "检查是否因记录损坏被跳过",
+        "建议缩小条件或换金属集合重试"
+      ],
+      "severe_errors": [
+        "把工具失败答成没有文献",
+        "忽略 warnings 中的损坏记录"
+      ]
+    }
+  ]
+}

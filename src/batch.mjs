@@ -1,5 +1,6 @@
 import { mkdir, readFile, stat } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ModelRuntime, ModelRegistry } from '@earendil-works/pi-coding-agent';
 import { saveJson } from './batch-io.mjs';
@@ -14,6 +15,9 @@ import { quotaRetryDelay } from './batch-retry.mjs';
 import { batchModelKey, batchRequestKey, compactCallCache, checkedExtraction, sameSourceVersions, validateBatchOutput } from './batch-cache.ts';
 import { sourceVersion } from './distillation/source-version.ts';
 import { classifyError } from './errors.ts';
+import { acquireLock, describeLock, heartbeat, lockStatus, readLock, releaseLock, LOCK_FILE } from './batch-lock.mjs';
+import { reconcileQueue, statusCounts } from './batch-recover.mjs';
+import { table } from './cli-format.mjs';
 
 /** @typedef {ReturnType<typeof checkedExtraction>} SavedExtraction */
 /** @typedef {SavedExtraction['metadata'] & { usage?: unknown, seconds?: number }} CallMetadata */
@@ -28,6 +32,8 @@ import { classifyError } from './errors.ts';
 /** @param {unknown} error */
 const errorMessage = error => error instanceof Error ? error.message : String(error);
 const root = fileURLToPath(new URL('../', import.meta.url));
+/** @type {string | null} */
+let lockInstanceId = null;
 const checkOnly = process.argv.includes('--check-only');
 const repairExisting = process.argv.includes('--repair-existing');
 const distillOnly = process.argv.includes('--distill-only');
@@ -38,12 +44,13 @@ if ([checkOnly, repairExisting, distillOnly].filter(Boolean).length > 1) throw E
 const reuseDraft = checkOnly || repairExisting;
 const afterAt = process.argv.indexOf('--after');
 const onlyAt = process.argv.indexOf('--only');
-if ((afterAt < 0) === (onlyAt < 0)) throw Error('请指定 --after SPINA-0005 或 --only SPINA-0006,SPINA-0007');
+const statusOnly = process.argv.includes('--status');
+const recoverOnly = process.argv.includes('--recover');
+if (statusOnly && recoverOnly) throw Error('--status 与 --recover 不能同时使用');
 if (afterAt >= 0 && !/^SPINA-\d{4}$/.test(process.argv[afterAt + 1] ?? '')) throw Error('用法：npm run batch -- --after SPINA-0005');
 const after = afterAt >= 0 ? Number(process.argv[afterAt + 1].slice(-4)) : 0;
 const onlyIds = onlyAt >= 0 ? (process.argv[onlyAt + 1] ?? '').split(',') : null;
 if (onlyIds && (!onlyIds.length || onlyIds.some(id => !/^SPINA-\d{4}$/.test(id)) || new Set(onlyIds).size !== onlyIds.length)) throw Error('--only 需要逗号分隔的唯一 SPINA-#### ID');
-const distillConfig = deepSeekConfig();
 const extractionDirectory = resolve(root, 'data/distillation/batch');
 const directory = jobId ? resolve(extractionDirectory, 'jobs', jobId) : extractionDirectory;
 await mkdir(directory, { recursive: true });
@@ -51,7 +58,100 @@ await mkdir(directory, { recursive: true });
 const save = (name, value) => saveJson(resolve(directory, name), value);
 /** @template T @param {string} path @param {T} fallback @returns {Promise<T>} */
 const load = async (path, fallback) => { try { return JSON.parse(await readFile(path, 'utf8')); } catch (error) { if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') return fallback; throw error; } };
+const statusOrder = ['pending', 'claimed', 'running', 'waiting_for_quota', 'waiting_for_network', 'published', 'published_uncertain', 'needs_review', 'already_published', 'source_unavailable', 'failed', 'skipped', 'cancelled'];
+
+async function printStatus() {
+  const queue = await load(resolve(directory, 'queue.json'), /** @type {QueueItem[]} */ ([]));
+  const control = await load(resolve(directory, 'state.json'), /** @type {BatchControl | Record<string, never>} */ ({}));
+  const lock = await readLock(extractionDirectory);
+  const counts = new Map();
+  for (const item of queue) counts.set(item.status, (counts.get(item.status) ?? 0) + 1);
+  console.log('SpinA 批处理状态');
+  console.log(`队列目录：${relative(root, directory)}`);
+  console.log(`单实例锁：${describeLock(lock, lockStatus(lock))}`);
+  console.log(`控制状态：${'status' in control ? control.status : '无记录'}${'mode' in control && control.mode ? ` · ${control.mode}` : ''}${'updated_at' in control && control.updated_at ? ` · 更新于 ${control.updated_at}` : ''}`);
+  console.log(`队列：${queue.length} 项`);
+  if (queue.length) console.log(table(['状态', '数量'], statusOrder.filter(status => counts.has(status)).map(status => [status, counts.get(status)])));
+  const attention = queue.filter(item => ['failed', 'waiting_for_quota', 'waiting_for_network', 'source_unavailable'].includes(item.status));
+  if (attention.length) {
+    console.log('\n需要处理的任务：');
+    console.log(table(['论文', '状态', '错误类别', '说明'], attention.slice(0, 20).map(item => [item.paper_id, item.status, item.error_kind ?? '', item.message ?? ''])));
+    if (attention.length > 20) console.log(`另有 ${attention.length - 20} 项，见 queue.json。`);
+  }
+  const repairable = queue.filter(item => item.status === 'pending' || item.status === 'failed').length;
+  console.log(`\n可重试 ${repairable} 项。恢复入口：npm run batch -- --recover（对照数据库终态重排队列，不调用模型）。`);
+}
+
+async function recoverQueue() {
+  const acquired = await acquireLock(extractionDirectory, { mode: 'recover', jobId });
+  if (!acquired.acquired) {
+    console.error(`拒绝恢复：${acquired.lock ? describeLock(acquired.lock, acquired.status) : '无法读取锁文件'}`);
+    console.error('同一工作库只允许一个写入进程；请先等待其结束。');
+    process.exitCode = 1; return;
+  }
+  const instanceId = acquired.lock.instance_id;
+  try {
+    const queue = await load(resolve(directory, 'queue.json'), /** @type {QueueItem[]} */ ([]));
+    const store = await ExperimentStore.openExisting(root);
+    /** @type {Map<string, number>} */
+    const revisions = new Map();
+    let reconciled, report;
+    try {
+      reconciled = reconcileQueue(queue, {
+        isPublished: paperId => {
+          const record = store?.getPaper(paperId);
+          if (!record) return false;
+          revisions.set(paperId, record.revision);
+          return true;
+        },
+        artifactExists: (paperId, runId) => existsSync(resolve(root, 'data/distillation/runs', runId, 'record.json')),
+        reuseDraft,
+      });
+      report = reconciled.report;
+    } finally { store?.close(); }
+    for (const item of reconciled.queue) {
+      const revision = revisions.get(item.paper_id);
+      if (revision !== undefined && item.status === 'already_published') item.revision = revision;
+    }
+    await save('queue.json', reconciled.queue);
+    const state = await load(resolve(directory, 'state.json'), /** @type {Record<string, unknown> | null} */ (null));
+    if (state && typeof state === 'object') {
+      state.counts = statusCounts(reconciled.queue);
+      state.updated_at = new Date().toISOString();
+      await save('state.json', state);
+    }
+    console.log('批处理恢复完成（未调用模型）');
+    console.log(`队列 ${report.total} 项；重排为待处理 ${report.reset_pending.length} 项；确认为已发布 ${report.already_published.length} 项；保留等待状态 ${report.waiting_kept.length} 项。`);
+    if (report.reset_pending.length) console.log(`  重排：${report.reset_pending.slice(0, 12).join('、')}${report.reset_pending.length > 12 ? ' …' : ''}`);
+    if (report.already_published.length) console.log(`  已发布：${report.already_published.slice(0, 12).join('、')}${report.already_published.length > 12 ? ' …' : ''}`);
+    if (report.reusable_artifacts.length) console.log(`  可复用任务产物 ${report.reusable_artifacts.length} 个（调用缓存会跳过已完成阶段）：${report.reusable_artifacts.slice(0, 6).join('、')}`);
+    console.log('下一步：用同一 --after/--only 命令继续；已发布论文不会重复扣费。');
+  } finally { await releaseLock(extractionDirectory, instanceId); }
+}
+
+if (statusOnly) { await printStatus(); process.exit(0); }
+if (recoverOnly) { await recoverQueue(); process.exit(process.exitCode ?? 0); }
+
+if ((afterAt < 0) === (onlyAt < 0)) throw Error('请指定 --after SPINA-0005 或 --only SPINA-0006,SPINA-0007');
+const distillConfig = deepSeekConfig();
 const catalog = await readCatalog(root);
+const acquired = await acquireLock(extractionDirectory, { mode: distillOnly ? 'distill_only' : checkOnly ? 'check_existing_drafts' : repairExisting ? 'repair_existing_drafts' : 'distill_and_verify', jobId });
+if (!acquired.acquired) {
+  console.error(`已有批处理进程在写同一个工作库，本次拒绝启动。\n${acquired.lock ? describeLock(acquired.lock, acquired.status) : '无法读取锁文件'}`);
+  console.error('同一工作库只允许一个写入进程。用 npm run batch -- --status 查看进度，或等其结束后重试。');
+  process.exit(1);
+}
+if (acquired.stale) console.warn(`已清理失效锁：${acquired.stale.lock.pid}（${acquired.stale.reason}）`);
+lockInstanceId = acquired.lock.instance_id;
+const ownInstanceId = lockInstanceId;
+// Default signal termination stops all work; the next launch can reclaim a dead PID.
+process.on('exit', () => {
+  // Remove only our own lock; a lock replaced by another instance must survive.
+  try {
+    const lock = JSON.parse(readFileSync(resolve(extractionDirectory, LOCK_FILE), 'utf8'));
+    if (lock.instance_id === ownInstanceId) rmSync(resolve(extractionDirectory, LOCK_FILE), { force: true });
+  } catch { /* best effort on exit */ }
+});
 const queue = await load(resolve(directory, 'queue.json'), /** @type {QueueItem[]} */ ([]));
 for (const item of queue) if (item.status === 'running' || item.status === 'claimed') item.status = 'pending';
 const selectedPapers = onlyIds ? catalog.filter(p => onlyIds.includes(p.paper_id)) : catalog.filter(p => Number(p.paper_id.slice(-4)) > after);
@@ -77,7 +177,15 @@ const control = { status: 'running', mode: distillOnly ? 'distill_only' : checkO
 /** @param {unknown} value */
 const emit = value => console.log(JSON.stringify(value));
 let snapshots=Promise.resolve();
-const snapshot = () => { control.updated_at = new Date().toISOString();const state={...structuredClone(control),counts:Object.fromEntries([...new Set(queue.map(x=>x.status))].map(s=>[s,queue.filter(x=>x.status===s).length]))},items=structuredClone(queue);snapshots=snapshots.catch(()=>{}).then(async()=>{await save('state.json',state);await save('queue.json',items);});return snapshots; };
+const snapshot = () => { control.updated_at = new Date().toISOString();const state={...structuredClone(control),counts:Object.fromEntries([...new Set(queue.map(x=>x.status))].map(s=>[s,queue.filter(x=>x.status===s).length]))},items=structuredClone(queue);snapshots=snapshots.catch(()=>{}).then(async()=>{await save('state.json',state);await save('queue.json',items);
+  // A replaced lock means another process now owns this database; stop instead of writing on.
+  // A transient write failure is reported but retried on the next snapshot.
+  if (lockInstanceId) {
+    try {
+      if (!await heartbeat(extractionDirectory, lockInstanceId)) { stopRequested = true; emit({ event: 'lock_lost', instance_id: lockInstanceId }); }
+    } catch (error) { emit({ event: 'lock_heartbeat_failed', message: errorMessage(error) }); }
+  }
+});return snapshots; };
 let stopRequested = false;
 const stopFileRequested = async () => Boolean((await load(resolve(directory, 'control.json'), /** @type {{stop?: boolean}} */ ({}))).stop);
 /** @param {QueueItem} item @param {number} milliseconds */

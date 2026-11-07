@@ -15,6 +15,7 @@ import { classifyError } from '../errors.ts';
 import { readSamplePreparation } from './preparation.ts';
 import { readPreparationEvidence } from './evidence.ts';
 import { searchPreparationConditions, PreparationConditionQuerySchema } from './conditions.ts';
+import { searchRouteConstraints, RouteConstraintQuerySchema } from './route.ts';
 
 const id = Type.String({ pattern: '^[A-Za-z0-9_-]{1,80}$' });
 const SourceInputSchema = Type.Object({
@@ -346,6 +347,17 @@ export function registerDistillationTools(pi: ExtensionAPI): void {
     parameters: PreparationConditionQuerySchema,
     annotations: { readOnlyHint: true, openWorldHint: false },
     execute: async (_callId, params, signal, _onUpdate, ctx) => response(await searchPreparationConditions(ctx.cwd, params, signal)),
+  });
+
+  pi.registerTool({
+    name: 'search_route_constraints',
+    label: '按整条路线约束筛选',
+    description: '把样品及其显式共用祖先的全部步骤聚合成整条路线，再判断最高温度、总时长、必需/排除操作。结果分满足、不满足、无法判断三态：范围用上界判最高温度，缺少时长的步骤只给下界，不会用中点或估计值；单步命中不代表整条路线满足。必需操作缺失只表示库内未记录，不能断言实际未使用。步骤与操作按受控中英文同义词匹配。route.structure 给出步骤来源（own/inherited）与继承链；记录没有并行或替换标记时，顺序按记录顺序处理，不能当作已验证的工序顺序。',
+    promptSnippet: '按整条路线的最高温度、总时长或必需操作筛选候选。',
+    promptGuidelines: ['用户问“整条路线是否低于某温度/在多少小时内完成”时使用本工具；只筛单步条件用 search_preparation_conditions。', 'undetermined 不等于不符合，也不等于符合；回答时说明缺少哪些步骤或时长。', 'required_operations 未命中时说明库内未记录，不推断实际未使用；forbidden_operations 命中才是明确违反。'],
+    parameters: RouteConstraintQuerySchema,
+    annotations: { readOnlyHint: true, openWorldHint: false },
+    execute: async (_callId, params, signal, _onUpdate, ctx) => response(await searchRouteConstraints(ctx.cwd, params, signal)),
   });
 
   pi.registerCommand('distill', {

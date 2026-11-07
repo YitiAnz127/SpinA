@@ -32,34 +32,39 @@ export async function readPreparationEvidence(root: string, reference: RecordRef
   signal?.throwIfAborted();
   const store = await ExperimentStore.openExisting(root);
   if (!store) throw new Error('检索版本不可用，请重新检索后反查');
-  try {
-    const record = store.getReferencedPaper(reference);
-    const chain = preparationChain(record.draft, sampleId, signal);
-    const matches = chain.flatMap(sample => preparationFields(sample)
-      .filter(field => field.field_path === fieldPath).map(field => ({ ...field, source_sample_id: sample.local_id })));
-    if (!matches.length) throw new Error('所选样品及其共用祖先中不存在该字段；请使用流程工具中的对象 ID 和字段名，不使用数组下标或其他分支字段');
-    const scope = new Set(chain.map(sample => sample.local_id));
-    const related = (path: string) => path === fieldPath || path.startsWith(`${fieldPath}.`) || fieldPath.startsWith(`${path}.`);
-    return {
-      paper: record.paper, record_ref: { ...reference }, sample_id: sampleId,
-      field_path: fieldPath, ambiguous: matches.length > 1,
-      evidence_scope: 'stored_record' as const,
-      fields: matches.map(({ source_sample_id, fact, context }) => ({
-        source_sample_id,
-        has_recorded_content: fact.raw !== null || fact.value !== null || Boolean(fact.note.trim()) || fact.evidence.length > 0 || fact.status !== 'not_reported',
-        fact, ...(context ? { context } : {}),
-      })),
-      sources: [...new Set(matches.flatMap(match => match.fact.evidence.map(ref => ref.source_id)))].map(id => {
-        const source = record.sources.find(source => source.id === id);
-        return source ? { id, kind: source.kind, path: source.path } : { id, missing_metadata: true };
-      }),
-      context: {
-        samples: chain.map(sample => ({ sample_id: sample.local_id, name: sample.name, shared_from: sample.shared_from,
-          variables: preparationVariables(sample), notes: sample.unresolved_questions })),
-        paper_notes: record.draft.notes,
-      },
-      issues: record.verification.issues.filter(issue => issue.resolution_status !== 'resolved' &&
-        (issue.sample_local_id === null || scope.has(issue.sample_local_id)) && related(issue.field_path)),
-    };
-  } finally { store.close(); }
+  try { return preparationEvidence(store, reference, sampleId, fieldPath, signal); }
+  finally { store.close(); }
+}
+
+/** Same read against an already-open store, so read-only entry points need no project layout. */
+export function preparationEvidence(store: ExperimentStore, reference: RecordReference, sampleId: string, fieldPath: string, signal?: AbortSignal) {
+  signal?.throwIfAborted();
+  const record = store.getReferencedPaper(reference);
+  const chain = preparationChain(record.draft, sampleId, signal);
+  const matches = chain.flatMap(sample => preparationFields(sample)
+    .filter(field => field.field_path === fieldPath).map(field => ({ ...field, source_sample_id: sample.local_id })));
+  if (!matches.length) throw new Error('所选样品及其共用祖先中不存在该字段；请使用流程工具中的对象 ID 和字段名，不使用数组下标或其他分支字段');
+  const scope = new Set(chain.map(sample => sample.local_id));
+  const related = (path: string) => path === fieldPath || path.startsWith(`${fieldPath}.`) || fieldPath.startsWith(`${path}.`);
+  return {
+    paper: record.paper, record_ref: { ...reference }, sample_id: sampleId,
+    field_path: fieldPath, ambiguous: matches.length > 1,
+    evidence_scope: 'stored_record' as const,
+    fields: matches.map(({ source_sample_id, fact, context }) => ({
+      source_sample_id,
+      has_recorded_content: fact.raw !== null || fact.value !== null || Boolean(fact.note.trim()) || fact.evidence.length > 0 || fact.status !== 'not_reported',
+      fact, ...(context ? { context } : {}),
+    })),
+    sources: [...new Set(matches.flatMap(match => match.fact.evidence.map(ref => ref.source_id)))].map(id => {
+      const source = record.sources.find(source => source.id === id);
+      return source ? { id, kind: source.kind, path: source.path } : { id, missing_metadata: true };
+    }),
+    context: {
+      samples: chain.map(sample => ({ sample_id: sample.local_id, name: sample.name, shared_from: sample.shared_from,
+        variables: preparationVariables(sample), notes: sample.unresolved_questions })),
+      paper_notes: record.draft.notes,
+    },
+    issues: record.verification.issues.filter(issue => issue.resolution_status !== 'resolved' &&
+      (issue.sample_local_id === null || scope.has(issue.sample_local_id)) && related(issue.field_path)),
+  };
 }

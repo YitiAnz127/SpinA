@@ -25,25 +25,30 @@ export async function readSamplePreparation(root: string, reference: RecordRefer
   signal?.throwIfAborted();
   const store = await ExperimentStore.openExisting(root);
   if (!store) throw new Error('检索版本不可用，请重新检索后展开');
-  try {
-    const record = store.getReferencedPaper(reference);
-    const chain = preparationChain(record.draft, sampleId, signal);
-    const scope = new Set(chain.map(sample => sample.local_id));
-    return {
-      paper: record.paper,
-      record_ref: { ...reference },
-      sample_id: sampleId,
-      sources: record.sources.map(source => ({ id: source.id, path: source.path, kind: source.kind })),
-      // Keep IDs, step order, short evidence and explicit unknowns. Paper-level notes may restrict inheritance.
-      preparation: compactDraft({ ...record.draft, samples: chain }),
-      match_entries: record.match_entries.filter(entry => entry.sample_local_id === sampleId),
-      candidate_match_entries: (record.candidate_match_entries ?? []).filter(entry => entry.sample_local_id === sampleId),
-      missing_information: missingInformation(record, scope),
-      source_limitations: sourceLimitations(record, scope),
-      issues: record.verification.issues
-        .filter(issue => isExtractionIssue(issue) && (issue.sample_local_id === null || scope.has(issue.sample_local_id)))
-        .map(issue => ({ sample_id: issue.sample_local_id, field_path: issue.field_path,
-          status: issue.resolution_status, message: issueText(issue) })),
-    };
-  } finally { store.close(); }
+  try { return samplePreparation(store, reference, sampleId, signal); }
+  finally { store.close(); }
+}
+
+/** Same read against an already-open store, so read-only entry points need no project layout. */
+export function samplePreparation(store: ExperimentStore, reference: RecordReference, sampleId: string, signal?: AbortSignal) {
+  signal?.throwIfAborted();
+  const record = store.getReferencedPaper(reference);
+  const chain = preparationChain(record.draft, sampleId, signal);
+  const scope = new Set(chain.map(sample => sample.local_id));
+  return {
+    paper: record.paper,
+    record_ref: { ...reference },
+    sample_id: sampleId,
+    sources: record.sources.map(source => ({ id: source.id, path: source.path, kind: source.kind })),
+    // Keep IDs, step order, short evidence and explicit unknowns. Paper-level notes may restrict inheritance.
+    preparation: compactDraft({ ...record.draft, samples: chain }),
+    match_entries: record.match_entries.filter(entry => entry.sample_local_id === sampleId),
+    candidate_match_entries: (record.candidate_match_entries ?? []).filter(entry => entry.sample_local_id === sampleId),
+    missing_information: missingInformation(record, scope),
+    source_limitations: sourceLimitations(record, scope),
+    issues: record.verification.issues
+      .filter(issue => isExtractionIssue(issue) && (issue.sample_local_id === null || scope.has(issue.sample_local_id)))
+      .map(issue => ({ sample_id: issue.sample_local_id, field_path: issue.field_path,
+        status: issue.resolution_status, message: issueText(issue) })),
+  };
 }

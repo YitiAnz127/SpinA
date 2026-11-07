@@ -8,6 +8,8 @@ data/*
 !data/README.md
 !data/demo/
 reports/
+backups/
+exports/
 .workbuddy-ai/
 *.log
 .npmrc

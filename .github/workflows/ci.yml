@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: node ${{ matrix.node }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows is the verified baseline; Ubuntu is checked for the declared support range.
+        os: [windows-latest, ubuntu-latest]
+        node: ['22', '24']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - name: Clean install
+        run: npm ci
+      - name: Syntax and type checks
+        run: npm run check
+      - name: Deterministic tests
+        run: npm test
+      - name: Environment diagnostics (offline)
+        run: npm run doctor -- --json
+      - name: Read-only demo query
+        run: npm run demo -- search --metals Ni,Co --limit 2 --json
+      - name: Route constraint smoke
+        run: npm run demo -- route --max-temp 400 --max-hours 24 --limit 2 --json
+      - name: Research layer smoke
+        run: |
+          npm run research -- capabilities --json
+          npm run research -- identity --paper SPINA-0020 --sample S_CoFe_ZrO2_series --database data/demo/spina.sqlite --json
+      - name: Report export
+        run: npm run report -- --database data/demo/spina.sqlite --output reports/ci-snapshot
+      - name: Backup and restore drill
+        run: npm run backup -- --database data/demo/spina.sqlite --drill
+        if: matrix.os == 'windows-latest' && matrix.node == '22'
+
+  pdf:
+    name: pdf extraction (python + poppler)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install poppler and CJK fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y poppler-utils fonts-noto-cjk
+      - run: npm ci
+      - name: Install pinned PDF dependencies and OCR language data
+        run: npm run setup:pdf
+      - name: Run the full suite with PDF support present
+        run: npm test
+      # A green run with every PDF case skipped proves nothing: fail when they do not execute.
+      - name: PDF cases must actually run
+        shell: bash
+        run: |
+          set -o pipefail
+          node --disable-warning=ExperimentalWarning --test tests/pdf-extraction.test.mjs | tee /tmp/pdf-tap.txt
+          grep -q "^# skipped 0$" /tmp/pdf-tap.txt
+      - name: Page image cases must actually run
+        shell: bash
+        run: |
+          set -o pipefail
+          node --disable-warning=ExperimentalWarning --test tests/image-cache.test.mjs | tee /tmp/image-tap.txt
+          grep -q "^# skipped 0$" /tmp/image-tap.txt

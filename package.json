@@ -9,6 +9,13 @@
   },
   "scripts": {
     "start": "node --env-file-if-exists=.env src/cli.mjs",
+    "demo": "node --disable-warning=ExperimentalWarning src/demo.mjs",
+    "doctor": "node --disable-warning=ExperimentalWarning src/doctor.mjs",
+    "review": "node --disable-warning=ExperimentalWarning src/review.mjs",
+    "export": "node --disable-warning=ExperimentalWarning src/export.mjs",
+    "research": "node --disable-warning=ExperimentalWarning src/research.mjs",
+    "backup": "node --disable-warning=ExperimentalWarning src/backup.mjs",
+    "eval:score": "node --disable-warning=ExperimentalWarning evals/score-tasks.mjs",
     "batch": "node --env-file-if-exists=.env src/batch.mjs",
     "setup:pdf": "node --env-file-if-exists=.env src/setup-pdf.mjs",
     "report": "node --disable-warning=ExperimentalWarning src/report.mjs",

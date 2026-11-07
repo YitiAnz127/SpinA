@@ -3,6 +3,7 @@ import { deriveMetalElements, preparationVariables, type Fact } from './schema.t
 import { preparationChain } from './preparation.ts';
 import { isExtractionIssue, missingInformation, sourceLimitations } from './missing-information.ts';
 import { Type } from 'typebox';
+import { materialSynonyms, stepSynonyms } from './synonyms.ts';
 
 const bounds = {
   min: Type.Optional(Type.Number()), max: Type.Optional(Type.Number()),
@@ -36,20 +37,21 @@ export interface ConditionQuery {
 }
 type Quantity = 'temperature' | 'duration';
 type State = 'field_match' | 'needs_review' | 'no';
-const seconds = { s: 1, min: 60, h: 3600, d: 86400 };
+export const durationSeconds: Record<'s' | 'min' | 'h' | 'd', number> = { s: 1, min: 60, h: 3600, d: 86400 };
+const seconds = durationSeconds;
 const normalize = (text: string) => text.normalize('NFKC').replace(/[−–—]/g, '-').replace(/\s+/g, ' ').trim();
-function contains(text: string, term: string) {
+export function textContains(text: string, term: string) {
   const needle = normalize(term).toLowerCase();
   const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   return /[a-z0-9]/i.test(needle)
     ? new RegExp(`(^|[^a-z0-9])${escaped}($|[^a-z0-9])`, 'i').test(normalize(text))
     : normalize(text).includes(needle);
 }
-const quantityOf = (name: string): Quantity | null => /rate|speed|速率|速度/i.test(name) ? null
+export const quantityOf = (name: string): Quantity | null => /rate|speed|速率|速度/i.test(name) ? null
   : /duration|(?:^|_)time(?:_|$)|时间|时长/i.test(name) ? 'duration'
   : /temperature|(?:^|_)temp(?:_|$)|温度/i.test(name) ? 'temperature' : null;
 
-function unitValue(number: number, unit: string, quantity: Quantity): number | null {
+export function unitValue(number: number, unit: string, quantity: Quantity): number | null {
   const value = normalize(unit).toLowerCase().replace(/\s+/g, '');
   if (quantity === 'temperature') {
     if (['°c', 'oc', 'ºc', '◦c', 'cº', 'c', '摄氏度', 'celsius'].includes(value)) return number;
@@ -91,6 +93,13 @@ function accepts(value: number, bounds: Bounds, scale: number) {
 }
 
 export async function searchPreparationConditions(root: string, query: ConditionQuery, signal?: AbortSignal) {
+  const store = await ExperimentStore.openExisting(root);
+  try { return searchPreparationConditionsWith(store, query, signal); }
+  finally { store?.close(); }
+}
+
+/** Same filter against an already-open (possibly read-only) store. */
+export function searchPreparationConditionsWith(store: ExperimentStore | null, query: ConditionQuery, signal?: AbortSignal) {
   const { limit = 20, offset = 0, include_uncertain = true } = query;
   const quantities = (['temperature', 'duration'] as const).filter(key => query[key]);
   const hasStepFilter = quantities.length > 0 || Boolean(query.step_terms?.length);
@@ -106,9 +115,7 @@ export async function searchPreparationConditions(root: string, query: Condition
   const metals = [...new Set(query.metal_elements ?? [])].sort();
   if (query.metal_elements && (!metals.length || metals.some(element => deriveMetalElements(element)?.join('|') !== element))) throw new Error('请提供有效金属集合');
   if (query.match && !['exact', 'superset'].includes(query.match)) throw new Error('金属匹配方式无效');
-  const store = await ExperimentStore.openExisting(root);
   const stored = store?.readPublishedVersions(include_uncertain) ?? { records: [], warnings: [] };
-  store?.close();
   const results: {
     paper: typeof stored.records[number]['record']['paper']; record_ref: RecordReference; sample_id: string; sample: string;
     possible: boolean; match_status: Exclude<State, 'no'>; review_required: true;
@@ -131,9 +138,10 @@ export async function searchPreparationConditions(root: string, query: Condition
         const chain = preparationChain(record.draft, target.local_id, signal), scope = new Set(chain.map(sample => sample.local_id));
         const reasons: string[] = [];
         const materials = chain.flatMap(sample => sample.materials.map(material => ({ source_sample_id: sample.local_id, field_path: `samples.${sample.local_id}.materials.${material.local_id}.identity`, fact: material.identity })));
+        const materialMatches = (text: string, terms: string[]) => terms.some(term => materialSynonyms(term).some(alias => textContains(text, alias)));
         const materialChecks = (query.materials ?? []).map(filter => ({ ...filter,
-          listed: materials.some(material => filter.terms.some(term => contains(String(material.fact.raw ?? material.fact.value ?? ''), term))),
-          evidence: materials.filter(material => filter.terms.some(term => contains(String(material.fact.raw ?? material.fact.value ?? ''), term))),
+          listed: materials.some(material => materialMatches(String(material.fact.raw ?? material.fact.value ?? ''), filter.terms)),
+          evidence: materials.filter(material => materialMatches(String(material.fact.raw ?? material.fact.value ?? ''), filter.terms)),
         }));
         if (materialChecks.some(check => check.mode === 'listed' && !check.listed || check.mode === 'not_listed' && check.listed)) continue;
         if (materialChecks.some(check => check.mode === 'not_listed')) reasons.push('原料条件只表示库内未列出，不证明实际未使用');
@@ -149,7 +157,7 @@ export async function searchPreparationConditions(root: string, query: Condition
         if (variables.length) candidates.push({ owner: target.local_id, step_id: '', operation: null, text: variables.map(variable => variable.name).join(' '), limited: true,
           fields: variables.map(variable => ({ ...variable, field_path: `samples.${target.local_id}.variables.${variable.name}` })) });
         if (hasStepFilter) for (const step of candidates) {
-          if (query.step_terms?.length && !query.step_terms.some(term => contains(step.text, term))) continue;
+          if (query.step_terms?.length && !query.step_terms.some(term => stepSynonyms(term).some(alias => textContains(step.text, alias)))) continue;
           if (quantities.length ? !step.fields.some(field => quantities.includes(quantityOf(field.name)!)) : !step.step_id) continue;
           relevantStep = true;
           const checks: typeof stepMatches[number]['checks'] = [];
@@ -190,7 +198,7 @@ export async function searchPreparationConditions(root: string, query: Condition
   results.sort((a, b) => Number(a.match_status === 'needs_review') - Number(b.match_status === 'needs_review') ||
     a.paper.paper_id.localeCompare(b.paper.paper_id) || a.record_ref.version.localeCompare(b.record_ref.version) || a.sample_id.localeCompare(b.sample_id));
   const page = results.slice(offset, offset + limit), next = offset + page.length;
-  return { query, semantics: '同一步骤内的字段候选筛选；多个原料条件取AND，别名组内取OR。字段命中不代表整条配方满足；展开后核对适用范围。',
+  return { query, semantics: '同一步骤内的字段候选筛选；多个原料条件取AND，别名组内取OR；步骤与原料按受控中英文同义词匹配，水合物与浓度规格不合并。字段命中不代表整条配方满足；展开后核对适用范围。',
     total: results.length, field_matches: results.filter(result => result.match_status === 'field_match').length,
     needs_review: results.filter(result => result.match_status === 'needs_review').length, scanned_samples: scanned, unevaluable_samples: unevaluable,
     offset, limit, has_more: next < results.length, next_offset: next < results.length ? next : null, results: page,

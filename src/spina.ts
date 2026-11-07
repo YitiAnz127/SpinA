@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { registerDistillationTools } from './distillation/tools.ts';
+import { registerResearchTools } from './research-tools.ts';
 import { deepSeekConfig } from './distillation/deepseek.ts';
 import { SOL_LABEL } from './model-policy.ts';
 import { assistantMarkdownCompatibility } from './markdown.ts';
@@ -7,6 +8,7 @@ import { assistantMarkdownCompatibility } from './markdown.ts';
 export default function spina(pi: ExtensionAPI) {
   pi.registerMarkdownTransformer(assistantMarkdownCompatibility);
   registerDistillationTools(pi);
+  registerResearchTools(pi);
   const showStatus = (ctx: ExtensionContext, state: string) => {
     if (ctx.hasUI) ctx.ui.setStatus("spina", `SpinA · ${state}`);
   };
@@ -34,6 +36,7 @@ export default function spina(pi: ExtensionAPI) {
         `DeepSeek 密钥：${deepSeekReady ? '已配置' : '未配置'}`,
         `核验模型：${SOL_LABEL}`,
         `问答模型：${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "未选择"} (${ctx.thinkingLevel ?? pi.getThinkingLevel()})`,
+        `研究产物：data/research/research.sqlite（F1–F6，不修改制备记录）`,
         `项目目录：${ctx.cwd}`,
       ].join("\n"), "info");
     },

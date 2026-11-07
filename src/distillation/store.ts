@@ -1,9 +1,9 @@
 import { DatabaseSync } from 'node:sqlite';
 import { mkdir, writeFile, rename } from 'node:fs/promises';
 import { realpathSync as realpath } from 'node:fs';
-import { resolve, relative, sep, isAbsolute } from 'node:path';
-import { randomUUID } from 'node:crypto';
-import type { PaperIdentity, Draft, Verification, SourceDocument, Fact } from './schema.ts';
+import { dirname, resolve, relative, sep, isAbsolute } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import type { PaperIdentity, Draft, Verification, SourceDocument, Fact, Evidence } from './schema.ts';
 import { deriveMetalElements, preparationVariables } from './schema.ts';
 import { isExtractionIssue, isSourceLimitationIssue, issueText, missingInformation, sourceLimitations, sourceInformationMessages, type MissingInformation } from './missing-information.ts';
 import type { ErrorKind } from '../errors.ts';
@@ -18,11 +18,38 @@ export interface PublishedRecord {
   verification_status?: 'verified' | 'uncertain';
   uncertainties?: string[];
   repair_rounds?: number;
+  /** Only the scope a human actually reviewed; absence means no human review happened. */
+  human_review?: HumanReview;
   sources: { id: string; path: string; kind: 'body' | 'si'; page_count: number; empty_text_pages: number[]; page_images?: { number: number; path: string }[]; page_extraction?: { number: number; method: string; table_count: number; warnings: string[] }[] }[];
   draft: Draft;
   verification: Verification;
   match_entries: { sample_local_id: string; phase_local_id: string; metal_elements: string[]; element_key: string; material_state: string }[];
   candidate_match_entries?: PublishedRecord['match_entries'];
+}
+export interface HumanReview {
+  reviewer: string;
+  reviewed_at: string;
+  previous_revision: number;
+  previous_verified_at: string;
+  /** Field-level record of what a person confirmed or changed; never a whole-paper stamp. */
+  actions: { action: ReviewActionKind; field_path: string; reason: string }[];
+}
+export type ReviewActionKind = 'confirm' | 'correct' | 'keep_conflict' | 'request_repair';
+export interface ReviewAction {
+  action_id: string;
+  paper_id: string;
+  version: RecordReference['version'];
+  revision: number;
+  reviewer: string;
+  reviewed_at: string;
+  action: ReviewActionKind;
+  field_path: string;
+  issue_index: number | null;
+  reason: string;
+  before: unknown;
+  after: unknown;
+  evidence: Evidence[] | null;
+  record_ref: RecordReference;
 }
 export interface RunState {
   run_id: string;
@@ -70,7 +97,7 @@ interface ExperimentSearchResult {
   review_notes?: string[];
 }
 
-type DeliveryInput = Pick<PublishedRecord, 'paper' | 'sources' | 'draft' | 'match_entries'> & Partial<Pick<PublishedRecord, 'verification' | 'verification_status' | 'uncertainties' | 'candidate_match_entries'>>;
+type DeliveryInput = Pick<PublishedRecord, 'paper' | 'sources' | 'draft' | 'match_entries'> & Partial<Pick<PublishedRecord, 'verification' | 'verification_status' | 'uncertainties' | 'candidate_match_entries' | 'human_review'>>;
 /** Shared by the reader and verifier so neither silently loses preparation constraints. */
 export function deliveryRecord(record: DeliveryInput) {
   const sourceMessages = sourceInformationMessages(record);
@@ -97,6 +124,11 @@ export function deliveryRecord(record: DeliveryInput) {
     ...(record.verification_status === 'uncertain' ? { status: 'uncertain',
       issues: (record.verification?.issues ?? []).filter(isExtractionIssue).map(issueText) } : {}),
     ...(reviewNotes.length ? { review_notes: reviewNotes } : {}),
+    // Only the scope a person actually reviewed; never a whole-paper stamp.
+    ...(record.human_review ? { human_review: {
+      reviewer: record.human_review.reviewer, reviewed_at: record.human_review.reviewed_at,
+      actions: record.human_review.actions,
+    } } : {}),
     sources: record.sources.map(source => ({ id: source.id, path: source.path })),
     samples: record.draft.samples.filter(sample => relevant.has(sample.local_id)).map(sample => {
       const pages = new Map<string, { source: string; page: number }>();
@@ -148,11 +180,14 @@ export class ExperimentStore {
   private root: string;
   private runsDirectory: string;
   private hasUncertainTable: boolean;
+  private hasReviewTable: boolean;
+  readonly databasePath: string;
 
-  private constructor(root: string, directory: string, readOnly = false) {
+  private constructor(root: string, databaseFile: string, readOnly = false) {
     this.root = root;
-    this.runsDirectory = resolve(directory, 'runs');
-    this.db = new DatabaseSync(resolve(directory, 'spina.sqlite'), { readOnly });
+    this.databasePath = databaseFile;
+    this.runsDirectory = resolve(dirname(databaseFile), 'runs');
+    this.db = new DatabaseSync(databaseFile, { readOnly });
     if (!readOnly) this.db.exec(`
       CREATE TABLE IF NOT EXISTS papers (
         paper_id TEXT PRIMARY KEY, doi TEXT NOT NULL UNIQUE, title TEXT NOT NULL,
@@ -164,8 +199,17 @@ export class ExperimentStore {
       CREATE TABLE IF NOT EXISTS uncertain_papers (
         paper_id TEXT PRIMARY KEY, record_json TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS review_actions (
+        action_id TEXT PRIMARY KEY, paper_id TEXT NOT NULL, version TEXT NOT NULL,
+        revision INTEGER NOT NULL, reviewer TEXT NOT NULL, reviewed_at TEXT NOT NULL,
+        action TEXT NOT NULL, field_path TEXT NOT NULL, issue_index INTEGER,
+        reason TEXT NOT NULL, before_json TEXT, after_json TEXT, evidence_json TEXT,
+        record_ref_json TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS review_actions_paper ON review_actions(paper_id, reviewed_at);
     `);
     this.hasUncertainTable = Boolean(this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='uncertain_papers'").get());
+    this.hasReviewTable = Boolean(this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='review_actions'").get());
   }
 
   static async open(root: string): Promise<ExperimentStore> {
@@ -181,7 +225,7 @@ export class ExperimentStore {
     assertWithin(root, realpath(resolve(actual, 'runs')));
     try { assertWithin(root, realpath(resolve(actual, 'spina.sqlite'))); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-    return new ExperimentStore(root, actual);
+    return new ExperimentStore(root, resolve(actual, 'spina.sqlite'));
   }
 
   static async openExisting(root: string): Promise<ExperimentStore | null> {
@@ -189,7 +233,18 @@ export class ExperimentStore {
     const directory = resolve(root, 'data/distillation');
     try { assertWithin(root, realpath(resolve(directory, 'spina.sqlite'))); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
-    return new ExperimentStore(root, directory, true);
+    return new ExperimentStore(root, resolve(directory, 'spina.sqlite'), true);
+  }
+
+  /** Open an explicit database file read-only, e.g. the bundled demo snapshot. Never creates files. */
+  static async openReadOnly(databasePath: string): Promise<ExperimentStore> {
+    let actual: string;
+    try { actual = realpath(databasePath); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error(`数据库不存在：${databasePath}`);
+      throw error;
+    }
+    return new ExperimentStore(dirname(actual), actual, true);
   }
 
   getPaper(paperId: string, version: 'preferred' | RecordReference['version'] = 'preferred'): PublishedRecord | null {
@@ -371,19 +426,104 @@ export class ExperimentStore {
         const expectedStatus = record.verification_status === 'uncertain' ? 'published_uncertain' : 'published';
         if (!active || active.status !== 'running' || active.paper_id !== record.paper.paper_id || completedRun.paper_id !== record.paper.paper_id || completedRun.status !== expectedStatus) throw new Error('发布任务与论文或终态不一致');
       }
-      if (record.verification_status === 'uncertain') {
-        this.db.prepare('INSERT INTO uncertain_papers (paper_id, record_json) VALUES (?, ?) ON CONFLICT(paper_id) DO UPDATE SET record_json=excluded.record_json').run(record.paper.paper_id, JSON.stringify(record));
-      } else {
-        this.db.prepare('INSERT INTO papers (paper_id, doi, title, revision, verified_at, record_json) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(paper_id) DO UPDATE SET doi=excluded.doi, title=excluded.title, revision=excluded.revision, verified_at=excluded.verified_at, record_json=excluded.record_json')
-          .run(record.paper.paper_id, record.paper.doi, record.paper.title, record.revision, record.verified_at, JSON.stringify(record));
-        this.db.prepare('DELETE FROM uncertain_papers WHERE paper_id = ?').run(record.paper.paper_id);
-      }
+      this.writeRecord(record);
       if (completedRun) this.saveRun(completedRun);
       this.db.exec('COMMIT');
     } catch (error) {
       this.db.exec('ROLLBACK');
       throw error;
     }
+  }
+
+  /** Publish a human-reviewed revision and its audit rows in one transaction. */
+  publishReview(record: PublishedRecord, expected: PaperState, actions: ReviewAction[]): void {
+    if (!actions.length) throw new Error('没有审核动作，拒绝发布');
+    if (!this.hasReviewTable) throw new Error('数据库缺少 review_actions 表；请用可写方式打开工作库');
+    if (actions.some(action => action.paper_id !== record.paper.paper_id || action.revision !== record.revision)) {
+      throw new Error('审核记录与论文或新修订号不一致，拒绝发布');
+    }
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const current = this.getPaperState(record.paper.paper_id);
+      if (expected?.paper_id !== current.paper_id || current.verified !== expected.verified || current.uncertain !== expected.uncertain) throw new Error('该论文在审核期间已被更新，请重新读取后再发布');
+      const previous = this.getPaper(record.paper.paper_id, record.verification_status === 'uncertain' ? 'uncertain' : 'verified');
+      if (previous && record.revision <= previous.revision) throw new Error('审核发布必须递增修订号，拒绝覆盖或降级现有修订');
+      this.writeRecord(record);
+      const insert = this.db.prepare(`INSERT INTO review_actions
+        (action_id, paper_id, version, revision, reviewer, reviewed_at, action, field_path, issue_index, reason, before_json, after_json, evidence_json, record_ref_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      for (const action of actions) insert.run(action.action_id, action.paper_id, action.version, action.revision,
+        action.reviewer, action.reviewed_at, action.action, action.field_path, action.issue_index,
+        action.reason, JSON.stringify(action.before ?? null), JSON.stringify(action.after ?? null),
+        action.evidence ? JSON.stringify(action.evidence) : null, JSON.stringify(action.record_ref));
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  private writeRecord(record: PublishedRecord): void {
+    if (record.verification_status === 'uncertain') {
+      this.db.prepare('INSERT INTO uncertain_papers (paper_id, record_json) VALUES (?, ?) ON CONFLICT(paper_id) DO UPDATE SET record_json=excluded.record_json').run(record.paper.paper_id, JSON.stringify(record));
+    } else {
+      this.db.prepare('INSERT INTO papers (paper_id, doi, title, revision, verified_at, record_json) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(paper_id) DO UPDATE SET doi=excluded.doi, title=excluded.title, revision=excluded.revision, verified_at=excluded.verified_at, record_json=excluded.record_json')
+        .run(record.paper.paper_id, record.paper.doi, record.paper.title, record.revision, record.verified_at, JSON.stringify(record));
+      this.db.prepare('DELETE FROM uncertain_papers WHERE paper_id = ?').run(record.paper.paper_id);
+    }
+  }
+
+  /** Row counts for diagnostics, backup manifests and restore checks. */
+  counts() {
+    const count = (table: string) => {
+      try { return (this.db.prepare(`SELECT COUNT(*) AS total FROM ${table}`).get() as { total: number }).total; }
+      catch { return 0; }
+    };
+    return {
+      papers: count('papers'), uncertain_papers: count('uncertain_papers'),
+      runs: count('runs'), review_actions: count('review_actions'),
+    };
+  }
+
+  /**
+   * Stable fingerprint of stored knowledge. Used to prove a backup/restore round trip
+   * without re-reading PDFs; it covers identity, revision, samples and match entries.
+   */
+  digest(): { sha256: string; counts: ReturnType<ExperimentStore['counts']>; samples: number; match_entries: number } {
+    // Read only the columns that every schema revision has; identity fields come from the record itself.
+    const rows = this.db.prepare("SELECT 'verified' AS version, paper_id, record_json FROM papers UNION ALL SELECT 'uncertain', paper_id, record_json FROM uncertain_papers").all() as { version: string; paper_id: string; record_json: string }[];
+    let samples = 0, matchEntries = 0;
+    const lines = rows.map(row => {
+      let record: PublishedRecord | null = null;
+      try { record = JSON.parse(row.record_json) as PublishedRecord; } catch { record = null; }
+      const sampleCount = record?.draft?.samples?.length ?? -1;
+      const matchCount = record?.match_entries?.length ?? -1;
+      if (sampleCount > 0) samples += sampleCount;
+      if (matchCount > 0) matchEntries += matchCount;
+      return `${row.version}|${row.paper_id}|${record?.revision ?? -1}|${record?.verified_at ?? ''}|${sampleCount}|${matchCount}`;
+    }).sort();
+    const hash = createHash('sha256');
+    for (const line of lines) hash.update(`${line}\n`);
+    return { sha256: hash.digest('hex'), counts: this.counts(), samples, match_entries: matchEntries };
+  }
+
+  listReviewActions(paperId?: string): ReviewAction[] {
+    if (!this.hasReviewTable) return [];
+    const rows = (paperId
+      ? this.db.prepare('SELECT * FROM review_actions WHERE paper_id = ? ORDER BY reviewed_at, action_id').all(paperId)
+      : this.db.prepare('SELECT * FROM review_actions ORDER BY reviewed_at, action_id').all()) as Record<string, string | number | null>[];
+    return rows.map(row => ({
+      action_id: String(row.action_id), paper_id: String(row.paper_id),
+      version: String(row.version) as ReviewAction['version'], revision: Number(row.revision),
+      reviewer: String(row.reviewer), reviewed_at: String(row.reviewed_at),
+      action: String(row.action) as ReviewAction['action'], field_path: String(row.field_path),
+      issue_index: row.issue_index === null ? null : Number(row.issue_index),
+      reason: String(row.reason),
+      before: row.before_json === null ? null : JSON.parse(String(row.before_json)),
+      after: row.after_json === null ? null : JSON.parse(String(row.after_json)),
+      evidence: row.evidence_json === null ? null : JSON.parse(String(row.evidence_json)) as Evidence[],
+      record_ref: JSON.parse(String(row.record_ref_json)) as RecordReference,
+    }));
   }
 
   close(): void { this.db.close(); }
