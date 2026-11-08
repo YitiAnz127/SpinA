@@ -137,7 +137,14 @@ test('native tool distills through DeepSeek and independently verifies through P
     assert.equal(result.details.status, 'published');
     assert.equal(requests.length, 1); assert.equal(contexts.length, 1);
     assert.ok(contexts.every(context => context.messages.length === 1));
-    assert.deepEqual(Object.keys(JSON.parse(requests[0].messages[1].content)).sort(), ['paper', 'sources']);
+    const content = requests[0].messages[1].content;
+    if (process.env.SPINA_PDFTOPPM_PATH) {
+      assert.ok(Array.isArray(content));
+      assert.equal(content[0].type, 'text');
+      assert.ok(content.some(block => block.type === 'image_url'));
+    }
+    const input = Array.isArray(content) ? content[0].text : content;
+    assert.deepEqual(Object.keys(JSON.parse(input)).sort(), ['paper', 'sources']);
     const store = await ExperimentStore.open(root);
     assert.equal(store.getPaper('FIXTURE-001').distilled_by, 'deepseek/deepseek-flash:high');
     assert.equal(store.getPaper('FIXTURE-001').verified_by, 'openai-codex/gpt-6.1-sol:low');

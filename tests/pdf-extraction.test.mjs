@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import childProcess, { execFile } from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
 import { promisify } from 'node:util';
 import { mkdir, mkdtemp, readFile, readdir, writeFile, rm, copyFile } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
@@ -84,10 +85,24 @@ test('missing OCR language data fails clearly and releases temporary extraction 
 test('cancelling extraction stops its subprocess and releases temporary files', { skip: !python, timeout: 10000 }, async t => {
   const root = await fixture(t);
   const abort = new AbortController();
-  const timer = setTimeout(() => abort.abort(), 1000);
+  const spawn = childProcess.spawn;
+  let ocrClosed = false;
+  const trackedSpawn = t.mock.method(childProcess, 'spawn', (executable, args, options) => {
+    const child = spawn(executable, args, options);
+    if (executable === process.execPath) {
+      child.once('spawn', () => abort.abort());
+      child.once('close', () => { ocrClosed = true; });
+    }
+    return child;
+  });
+  syncBuiltinESMExports();
   try {
     await assert.rejects(readSources(root, [{ path: 'data/paper/scanned.pdf' }], abort.signal), error => error.name === 'AbortError');
-  } finally { clearTimeout(timer); }
+    assert.ok(ocrClosed, 'OCR subprocess closed before the extraction rejected');
+  } finally {
+    trackedSpawn.mock.restore();
+    syncBuiltinESMExports();
+  }
   assert.deepEqual(await readdir(resolve(root, '.runtime/pdf-extraction')), []);
 });
 
