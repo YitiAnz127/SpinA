@@ -64,6 +64,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y poppler-utils fonts-noto-cjk
+          pdftoppm_path="$(command -v pdftoppm)"
+          printf 'SPINA_PDFTOPPM_PATH=%s\n' "$pdftoppm_path" >> "$GITHUB_ENV"
       - run: npm ci
       - name: Install pinned PDF dependencies and OCR language data
         run: npm run setup:pdf
